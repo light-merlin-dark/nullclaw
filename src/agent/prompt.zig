@@ -21,12 +21,18 @@ const pathStartsWith = path_prefix.pathStartsWith;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Maximum characters to include from a single workspace identity file.
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+/// Raised 20_000 → 28_000 with BOOTSTRAP_TOTAL_MAX_CHARS (2026-08-21,
+/// founder-delegated canvas decision): the two caps must move together —
+/// raising only the total leaves a >20k identity file truncated anyway.
+const BOOTSTRAP_MAX_CHARS: usize = 28_000;
 /// Read up to three extra bytes so callers can keep UTF-8 valid while still
 /// distinguishing "exactly at cap" from "truncated beyond cap".
 const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 3;
 /// Maximum total characters from injected bootstrap identity files.
-const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 24_000;
+/// Raised 24_000 → 32_000 (2026-08-21, founder-delegated canvas decision) so
+/// a composed workspace of ~29k chars (AGENTS.md + TOOLS.md + MEMORY.md)
+/// arrives whole instead of silently truncating the tail.
+const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 32_000;
 /// Maximum bytes allowed for guarded workspace bootstrap file reads.
 const MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -731,7 +737,7 @@ test "buildSystemPrompt applies bootstrap truncation to AIEOS identity" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 28000 chars -- use `read` for full file]") != null);
 }
 
 test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
@@ -1794,8 +1800,8 @@ test "buildSystemPrompt truncates project context at total bootstrap budget" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content) == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content[0 .. BOOTSTRAP_TOTAL_MAX_CHARS - BOOTSTRAP_MAX_CHARS]) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (24000 chars total)]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... project context truncated at 24000 chars total -- use `read` for full files]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (32000 chars total)]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... project context truncated at 32000 chars total -- use `read` for full files]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### USER.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "user-should-not-appear-after-budget") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") == null);
@@ -1844,7 +1850,7 @@ test "buildSystemPrompt omits per-file truncation marker when total budget stops
     defer allocator.free(file_truncation_marker);
 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, prompt, file_truncation_marker));
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (24000 chars total)]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (32000 chars total)]") != null);
 }
 
 test "buildSystemPrompt truncates oversized disk bootstrap files instead of failing read" {
@@ -1874,7 +1880,7 @@ test "buildSystemPrompt truncates oversized disk bootstrap files instead of fail
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[Could not read: SOUL.md]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 28000 chars -- use `read` for full file]") != null);
 }
 
 test "workspacePromptFingerprint is stable when files are unchanged" {
