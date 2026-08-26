@@ -36,6 +36,79 @@ const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 32_000;
 /// Maximum bytes allowed for guarded workspace bootstrap file reads.
 const MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// The identity files injected into the prompt, IN ORDER. Order is
+/// delivery-relevant, not cosmetic: the total budget is spent as this list is
+/// walked, so whoever is last is whoever gets cut. Hoisted to file scope so
+/// `buildIdentitySection` and `bootstrapLimits()` cannot disagree about it.
+const IDENTITY_FILES = [_][]const u8{
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "CONFIG.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+};
+
+/// Memory files, tried after the identity files. First hit wins on the provider
+/// path; the file fallback injects every distinct match.
+const MEMORY_FILES = [_][]const u8{ "MEMORY.md", "memory.md" };
+
+/// Every compiled limit that decides what a workspace actually DELIVERS to the
+/// model. A caller outside this process cannot read a Zig constant, so it can
+/// only restate one by hand and hope — which is how a raise to this source sat
+/// unbuilt in a vendored binary for five days while every downstream test
+/// stayed green. `nullclaw --bootstrap-limits` prints this struct instead, so
+/// the consumer can compare its belief against the binary it will actually run.
+pub const BootstrapLimits = struct {
+    /// Total characters of injected identity/memory content. `BOOTSTRAP_TOTAL_MAX_CHARS`.
+    bootstrap_total_max_chars: usize,
+    /// Per-file cap, binding independently of the total. `BOOTSTRAP_MAX_CHARS`.
+    bootstrap_file_max_chars: usize,
+    /// Bytes requested from a bootstrap provider, so "at cap" and "past cap" differ.
+    bootstrap_provider_excerpt_bytes: usize,
+    /// Hard read guard for a single workspace file.
+    max_workspace_bootstrap_file_bytes: u64,
+    /// The injection order — the thing that decides who gets cut.
+    identity_file_order: []const []const u8,
+    /// The memory files tried after the identity files.
+    memory_file_order: []const []const u8,
+};
+
+/// The compiled limits of THIS binary. Deterministic; no I/O, no config.
+pub fn bootstrapLimits() BootstrapLimits {
+    return .{
+        .bootstrap_total_max_chars = BOOTSTRAP_TOTAL_MAX_CHARS,
+        .bootstrap_file_max_chars = BOOTSTRAP_MAX_CHARS,
+        .bootstrap_provider_excerpt_bytes = BOOTSTRAP_PROVIDER_EXCERPT_BYTES,
+        .max_workspace_bootstrap_file_bytes = MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES,
+        .identity_file_order = &IDENTITY_FILES,
+        .memory_file_order = &MEMORY_FILES,
+    };
+}
+
+/// Exactly the `## Project Context` block this binary would inject for
+/// `workspace_dir` — the same function the agent loop calls, with no bootstrap
+/// provider, no identity config, no network and no model. Caller owns the slice.
+///
+/// This is the second half of the same confession: the limits say what the
+/// binary believes, this says what it would actually hand over.
+pub fn buildProjectContextSection(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+
+    try buildIdentitySection(allocator, w, workspace_dir, null, null);
+
+    buf = buf_writer.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
 const GuardedWorkspaceFileOpen = struct {
     file: std_compat.fs.File,
     canonical_path: []u8,
@@ -465,18 +538,7 @@ fn buildIdentitySection(
         &hit_total_bootstrap_limit,
     );
 
-    const identity_files = [_][]const u8{
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "CONFIG.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-        "BOOTSTRAP.md",
-    };
-
-    for (identity_files) |filename| {
+    for (IDENTITY_FILES) |filename| {
         try injectWorkspaceFile(
             allocator,
             w,
@@ -1126,8 +1188,7 @@ fn injectPreferredMemoryFile(
 ) !void {
     // When bootstrap provider is available, try loading MEMORY.md through it.
     if (bootstrap_provider) |bp| {
-        const memory_files = [_][]const u8{ "MEMORY.md", "memory.md" };
-        for (memory_files) |filename| {
+        for (MEMORY_FILES) |filename| {
             const content = bp.load_excerpt(allocator, filename, BOOTSTRAP_PROVIDER_EXCERPT_BYTES) catch null;
             if (content) |c| {
                 defer allocator.free(c);
@@ -1152,8 +1213,7 @@ fn injectPreferredMemoryFile(
         seen_memory_paths.deinit(allocator);
     }
 
-    const memory_files = [_][]const u8{ "MEMORY.md", "memory.md" };
-    for (memory_files) |filename| {
+    for (MEMORY_FILES) |filename| {
         const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
         if (opened == null) continue;
         var guarded = opened.?;

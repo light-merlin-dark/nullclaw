@@ -109,6 +109,8 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  mcp <{s}> [ARGS]
     \\  auth <{s}> <provider> [--import-codex]
     \\  update [--check] [--yes]
+    \\  --bootstrap-limits            Print the compiled workspace-delivery limits as JSON
+    \\  --print-bootstrap <DIR>       Print the project-context block this binary would inject
     \\
 ,
     .{
@@ -189,6 +191,14 @@ pub fn main(init: std.process.Init) !void {
     // Manifest protocol flags (checked before command dispatch)
     if (std.mem.eql(u8, args[1], "--export-manifest")) {
         try yc.export_manifest.run();
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "--bootstrap-limits")) {
+        try yc.bootstrap_limits.run();
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "--print-bootstrap")) {
+        try yc.bootstrap_limits.runPrint(allocator, args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "--list-models")) {
