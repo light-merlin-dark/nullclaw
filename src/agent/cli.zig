@@ -259,8 +259,39 @@ fn maybePrintLastProviderApiError(
     }
 }
 
+/// Upper bound on a stdin-delivered message. Large enough for the biggest
+/// composed prompt a caller has any business sending (measured heads run well
+/// under 256 KiB), small enough that a stuck writer cannot exhaust memory.
+const MAX_STDIN_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read the whole of stdin as the single-turn message.
+///
+/// This transport exists so a caller never has to put a private prompt in
+/// argv. `/proc/<pid>/cmdline` is world-readable — mode 444, and unless the
+/// host mounts `/proc` with `hidepid`, every local account can read the full
+/// command line of any process, including root's. A stdin pipe has no such
+/// reader. It also sidesteps Linux's 128 KiB `MAX_ARG_STRLEN` cap on a single
+/// argv entry, which silently bounds how large an argv-carried prompt may be.
+fn readMessageFromStdin(allocator: std.mem.Allocator) ![]u8 {
+    const stdin = std_compat.fs.File.stdin();
+    var collected: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer collected.deinit(allocator);
+
+    var read_buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try stdin.read(&read_buffer);
+        if (n == 0) break;
+        if (n > MAX_STDIN_MESSAGE_BYTES - collected.items.len) return error.MessageTooLarge;
+        try collected.appendSlice(allocator, read_buffer[0..n]);
+    }
+    return collected.toOwnedSlice(allocator);
+}
+
 const ParsedAgentArgs = struct {
     message_arg: ?[]const u8 = null,
+    /// Read the message from stdin rather than from `-m`. Mutually exclusive
+    /// with `message_arg`; the parser refuses both.
+    message_stdin: bool = false,
     session_id: ?[]const u8 = null,
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
@@ -277,6 +308,7 @@ const AgentArgParseResult = union(enum) {
     ok: ParsedAgentArgs,
     missing_value: []const u8,
     invalid_temperature: []const u8,
+    conflicting_message_source,
 };
 
 fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
@@ -288,6 +320,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.message_arg = args[i];
+        } else if (std.mem.eql(u8, arg, "--message-stdin")) {
+            parsed.message_stdin = true;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
@@ -329,6 +363,10 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             parsed.verbose = true;
         }
     }
+    // Two message sources is an ambiguity, not a preference: silently winning
+    // one over the other is how a caller believing it moved off argv keeps
+    // publishing the prompt.
+    if (parsed.message_stdin and parsed.message_arg != null) return .conflicting_message_source;
     return .{ .ok = parsed };
 }
 
@@ -413,6 +451,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             log.err("Invalid --temperature value: {s}", .{value});
             return;
         },
+        .conflicting_message_source => {
+            log.err("Pass either -m/--message or --message-stdin, not both", .{});
+            return;
+        },
     };
     if (parsed_args.provider_override) |provider| {
         if (parsed_args.agent_name == null) {
@@ -486,7 +528,27 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var bw = std_compat.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
 
-    const message_arg = parsed_args.message_arg;
+    // A stdin-delivered message is read once, here, and owned for the rest of
+    // the turn. An empty read is a caller error rather than an invitation to
+    // fall through to the interactive REPL: a pipe that closed with nothing in
+    // it means the prompt was lost, and a REPL on a closed stdin exits looking
+    // like a successful empty turn.
+    const stdin_message: ?[]u8 = if (parsed_args.message_stdin)
+        readMessageFromStdin(allocator) catch |err| {
+            log.err("Could not read --message-stdin: {s}", .{@errorName(err)});
+            return;
+        }
+    else
+        null;
+    defer if (stdin_message) |owned| allocator.free(owned);
+    if (stdin_message) |owned| {
+        if (owned.len == 0) {
+            log.err("--message-stdin received an empty message", .{});
+            return;
+        }
+    }
+
+    const message_arg: ?[]const u8 = if (stdin_message) |owned| owned else parsed_args.message_arg;
     const session_id = parsed_args.session_id;
 
     const runtime_observer = try observability.RuntimeObserver.create(
@@ -1250,6 +1312,32 @@ test "parseAgentArgs returns error for missing option value" {
     const args = [_][]const u8{"--provider"};
     switch (parseAgentArgs(&args)) {
         .missing_value => |opt| try std.testing.expectEqualStrings("--provider", opt),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs accepts --message-stdin without a value" {
+    const args = [_][]const u8{ "--message-stdin", "-s", "api:default" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expect(parsed.message_stdin);
+    try std.testing.expect(parsed.message_arg == null);
+    try std.testing.expectEqualStrings("api:default", parsed.session_id.?);
+}
+
+test "parseAgentArgs refuses -m together with --message-stdin" {
+    // A caller that moved off argv must not keep an argv message that quietly
+    // wins; two sources is an error, in either order.
+    const argv_first = [_][]const u8{ "-m", "leaked", "--message-stdin" };
+    switch (parseAgentArgs(&argv_first)) {
+        .conflicting_message_source => {},
+        else => unreachable,
+    }
+    const stdin_first = [_][]const u8{ "--message-stdin", "--message", "leaked" };
+    switch (parseAgentArgs(&stdin_first)) {
+        .conflicting_message_source => {},
         else => unreachable,
     }
 }

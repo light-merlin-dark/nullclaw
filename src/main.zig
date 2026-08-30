@@ -398,6 +398,10 @@ fn printAgentUsage() void {
         \\
         \\INTERACTIVE / SINGLE-TURN MODE:
         \\  -m, --message MESSAGE        Run a single message (non-interactive)
+        \\  --message-stdin               Read the single message from stdin instead
+        \\                                of argv. Prefer this for anything private:
+        \\                                argv is world-readable via /proc, and a
+        \\                                single argv entry is capped at 128 KiB.
         \\  -s, --session SESSION         Resume a specific session
         \\  --provider PROVIDER           Override default provider
         \\  --model MODEL                 Override default model

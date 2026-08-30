@@ -30,3 +30,4 @@ config.json
 .cursor/
 .trae/
 .codebuddy/
+zig-out-linux/
