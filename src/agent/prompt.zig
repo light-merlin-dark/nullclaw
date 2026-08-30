@@ -24,7 +24,12 @@ const pathStartsWith = path_prefix.pathStartsWith;
 /// Raised 20_000 → 28_000 with BOOTSTRAP_TOTAL_MAX_CHARS (2026-08-21,
 /// founder-delegated canvas decision): the two caps must move together —
 /// raising only the total leaves a >20k identity file truncated anyway.
-const BOOTSTRAP_MAX_CHARS: usize = 28_000;
+/// Raised 28_000 → 34_000 with the total (2026-08-30, founder-delegated H-7
+/// budget decision): Granis's composed workspace reached 31,848 of 32,000 —
+/// 152 chars of headroom — after the attachment-ask discipline landed, and
+/// the residual 4,242 chars of per-tool discipline had been cut on every
+/// tenant since 2026-08-19.
+const BOOTSTRAP_MAX_CHARS: usize = 34_000;
 /// Read up to three extra bytes so callers can keep UTF-8 valid while still
 /// distinguishing "exactly at cap" from "truncated beyond cap".
 const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 3;
@@ -32,7 +37,15 @@ const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 3;
 /// Raised 24_000 → 32_000 (2026-08-21, founder-delegated canvas decision) so
 /// a composed workspace of ~29k chars (AGENTS.md + TOOLS.md + MEMORY.md)
 /// arrives whole instead of silently truncating the tail.
-const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 32_000;
+/// Raised 32_000 → 40_000 (2026-08-30, founder-delegated H-7 budget
+/// decision): the composed workspace sat at 31,848/32,000 and the next
+/// discipline line would have pushed real instructions off the wire. THE
+/// CONSTANT LIVES HERE AND ONLY HERE — the TS restatement
+/// (agent-workspace-composition.ts) must move in the same change, and
+/// `nullclaw --bootstrap-limits` is how a consumer checks the binary it
+/// actually runs (a raise to this source once sat unbuilt in the vendored
+/// binary for five days while every downstream test stayed green).
+const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 40_000;
 /// Maximum bytes allowed for guarded workspace bootstrap file reads.
 const MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -799,7 +812,7 @@ test "buildSystemPrompt applies bootstrap truncation to AIEOS identity" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 28000 chars -- use `read` for full file]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 34000 chars -- use `read` for full file]") != null);
 }
 
 test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
@@ -1147,6 +1160,19 @@ fn appendPromptSectionContent(
     if (trimmed.len == 0) return;
     if (remaining_bootstrap_chars.* == 0) {
         hit_total_bootstrap_limit.* = true;
+        // LOUD omission (the Hermes truncation-recovery pattern, ported
+        // 2026-08-30): a file dropped after the budget is spent used to
+        // vanish without a trace — the model could not know an instruction
+        // file existed, and neither could anyone reading the delivered
+        // prompt. The 28,003/32,000 loss shipped silently for every tenant
+        // because of exactly this. The marker costs a fixed ~90 chars
+        // OUTSIDE the budget accounting, deliberately: the budget governs
+        // content, and the confession about missing content must not itself
+        // be squeezed out by the condition it reports.
+        try w.print(
+            "[... {s} OMITTED ENTIRELY -- project context budget exhausted; use `read` on {s} for its content]\n\n",
+            .{ filename, filename },
+        );
         return;
     }
 
@@ -1777,7 +1803,12 @@ test "appendPromptSectionContent skips section when total budget is exhausted" {
 
     try std.testing.expect(hit_total_bootstrap_limit);
     buf = buf_writer.toArrayList();
-    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    // The CONTENT is skipped; the omission is LOUD (Hermes recovery-marker
+    // pattern, 2026-08-30). A file dropped after budget exhaustion used to
+    // vanish without a trace — the marker names the file and the read route.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "this should not be rendered") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "USER.md OMITTED ENTIRELY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "use `read` on USER.md") != null);
 }
 
 test "appendPromptSectionContent truncates at UTF-8 boundary" {
@@ -1821,7 +1852,10 @@ test "buildSystemPrompt truncates project context at total bootstrap budget" {
     defer allocator.free(agents_content);
     @memset(agents_content, 'A');
 
-    const soul_content = try allocator.alloc(u8, 5_000);
+    // Sized to overflow the TOTAL budget whatever the constants are: the
+    // per-file-capped AGENTS.md leaves (TOTAL - FILE) chars of room, so 2k
+    // beyond that guarantees the truncation this test exists to observe.
+    const soul_content = try allocator.alloc(u8, BOOTSTRAP_TOTAL_MAX_CHARS - BOOTSTRAP_MAX_CHARS + 2_000);
     defer allocator.free(soul_content);
     @memset(soul_content, 'B');
 
@@ -1860,8 +1894,8 @@ test "buildSystemPrompt truncates project context at total bootstrap budget" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content) == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content[0 .. BOOTSTRAP_TOTAL_MAX_CHARS - BOOTSTRAP_MAX_CHARS]) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (32000 chars total)]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... project context truncated at 32000 chars total -- use `read` for full files]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (40000 chars total)]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... project context truncated at 40000 chars total -- use `read` for full files]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### USER.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "user-should-not-appear-after-budget") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") == null);
@@ -1910,7 +1944,7 @@ test "buildSystemPrompt omits per-file truncation marker when total budget stops
     defer allocator.free(file_truncation_marker);
 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, prompt, file_truncation_marker));
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (32000 chars total)]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (40000 chars total)]") != null);
 }
 
 test "buildSystemPrompt truncates oversized disk bootstrap files instead of failing read" {
@@ -1940,7 +1974,7 @@ test "buildSystemPrompt truncates oversized disk bootstrap files instead of fail
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[Could not read: SOUL.md]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 28000 chars -- use `read` for full file]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 34000 chars -- use `read` for full file]") != null);
 }
 
 test "workspacePromptFingerprint is stable when files are unchanged" {
