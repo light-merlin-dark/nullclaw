@@ -55,6 +55,46 @@ const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
+/// Shortest per-call provider ceiling the budget division may produce. A call
+/// squeezed below this has no realistic chance of a completion, so the floor
+/// trades exact budget arithmetic for one honest final attempt.
+const MIN_PROVIDER_CALL_TIMEOUT_SECS: u64 = 20;
+
+/// The per-call provider ceiling for this iteration: HALF the remaining turn
+/// budget, floored at `MIN_PROVIDER_CALL_TIMEOUT_SECS`, never above the whole
+/// message timeout. With no budget (0), the configured message timeout passes
+/// through unchanged.
+///
+/// Halving is the property that matters: however slow or stalled one
+/// completion is, at least half of what remained is still there for the next
+/// move — the tool call, the retry, or the terminal commit. Measured
+/// motivation (2026-08-30): single completions of 80 s, 159 s and 162 s inside
+/// a 300 s clock, each leaving the turn to die with the reply written but
+/// uncommitted.
+fn perCallProviderTimeoutSecs(message_timeout_secs: u64, turn_budget_ms: u64, turn_elapsed_ms: u64) u64 {
+    if (turn_budget_ms == 0) return message_timeout_secs;
+    const remaining_ms = turn_budget_ms -| turn_elapsed_ms;
+    const half_secs = remaining_ms / 2_000;
+    const floor_secs = @min(message_timeout_secs, MIN_PROVIDER_CALL_TIMEOUT_SECS);
+    return @min(message_timeout_secs, @max(half_secs, floor_secs));
+}
+
+test "perCallProviderTimeoutSecs halves the remaining budget" {
+    // Fresh 300s budget: first call may take 150s, not 300s.
+    try std.testing.expectEqual(@as(u64, 150), perCallProviderTimeoutSecs(300, 300_000, 0));
+    // 240s spent of 300s: 30s remain in the half — floored at 20s minimum.
+    try std.testing.expectEqual(@as(u64, 30), perCallProviderTimeoutSecs(300, 300_000, 240_000));
+    // Nearly exhausted: the floor gives one honest final attempt.
+    try std.testing.expectEqual(@as(u64, 20), perCallProviderTimeoutSecs(300, 300_000, 295_000));
+    // Elapsed past the budget entirely: still the floor, never zero (which
+    // would mean UNBOUNDED at the transport layer).
+    try std.testing.expectEqual(@as(u64, 20), perCallProviderTimeoutSecs(300, 300_000, 400_000));
+    // No budget configured: passthrough.
+    try std.testing.expectEqual(@as(u64, 0), perCallProviderTimeoutSecs(0, 0, 50_000));
+    // A message timeout below the floor binds tighter than the floor.
+    try std.testing.expectEqual(@as(u64, 10), perCallProviderTimeoutSecs(10, 10_000, 9_500));
+}
+
 pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
@@ -2195,6 +2235,19 @@ pub const Agent = struct {
         var terminal_commit_dispatched = false;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
+        // Turn wall-clock budget (message_timeout_secs; 0 = unbounded). Two
+        // consumers, both measured against real turns dying on the 300 s
+        // commercial clock (2026-08-30: 53/80/159/162 s single completions):
+        //  - at ~80% spent, a one-time SYSTEM wrap-up notice tells the model
+        //    to stop discovery and produce the deliverable NOW (the Hermes
+        //    run_budget pattern), appended at the END of history so the
+        //    provider's prefix cache is untouched;
+        //  - each remaining provider call is capped at HALF the remaining
+        //    budget, so one slow or dead-stalled completion can no longer
+        //    consume the whole clock and leave nothing for the commit.
+        const turn_wall_started_ms: i64 = std_compat.time.milliTimestamp();
+        const turn_budget_ms: u64 = self.message_timeout_secs *| 1000;
+        var wrap_up_notice_injected = false;
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2205,6 +2258,22 @@ pub const Agent = struct {
                 const safe_injected = try self.redactOwnedForHistory(injected);
                 try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_injected });
             }
+
+            const turn_elapsed_ms: u64 = @intCast(@max(0, std_compat.time.milliTimestamp() - turn_wall_started_ms));
+            if (turn_budget_ms > 0 and !wrap_up_notice_injected and turn_elapsed_ms * 5 >= turn_budget_ms * 4) {
+                wrap_up_notice_injected = true;
+                const remaining_secs: u64 = (turn_budget_ms -| turn_elapsed_ms) / 1000;
+                const notice = try std.fmt.allocPrint(
+                    self.allocator,
+                    "SYSTEM TIME-BUDGET NOTICE: about {d}s of this turn's time budget remain. " ++
+                        "Stop discovery and further tool exploration now. Produce the deliverable " ++
+                        "from the state you already have, and complete the turn — if this lane " ++
+                        "commits through a terminal tool call, make that call next.",
+                    .{remaining_secs},
+                );
+                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = notice });
+            }
+            const per_call_timeout_secs = perCallProviderTimeoutSecs(self.message_timeout_secs, turn_budget_ms, turn_elapsed_ms);
 
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
@@ -2243,7 +2312,7 @@ pub const Agent = struct {
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = null,
-                        .timeout_secs = self.message_timeout_secs,
+                        .timeout_secs = per_call_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                         .include_reasoning = include_reasoning,
                     },
@@ -2280,7 +2349,7 @@ pub const Agent = struct {
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = null,
-                                .timeout_secs = self.message_timeout_secs,
+                                .timeout_secs = per_call_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
                             },
@@ -2318,7 +2387,7 @@ pub const Agent = struct {
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
-                        .timeout_secs = self.message_timeout_secs,
+                        .timeout_secs = per_call_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                         .include_reasoning = include_reasoning,
                     },
@@ -2354,7 +2423,7 @@ pub const Agent = struct {
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
+                                .timeout_secs = per_call_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
                             },
@@ -2393,7 +2462,7 @@ pub const Agent = struct {
                                 .temperature = self.temperature,
                                 .max_tokens = recovery_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
+                                .timeout_secs = per_call_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
                             },
@@ -2426,7 +2495,7 @@ pub const Agent = struct {
                             .temperature = self.temperature,
                             .max_tokens = request_max_tokens,
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
-                            .timeout_secs = self.message_timeout_secs,
+                            .timeout_secs = per_call_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                             .include_reasoning = include_reasoning,
                         },
@@ -2456,7 +2525,7 @@ pub const Agent = struct {
                                     .temperature = self.temperature,
                                     .max_tokens = recovery_max_tokens,
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                    .timeout_secs = self.message_timeout_secs,
+                                    .timeout_secs = per_call_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                     .include_reasoning = include_reasoning,
                                 },

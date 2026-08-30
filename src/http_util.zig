@@ -362,6 +362,43 @@ pub fn httpRequestWithStatusAndHeaders(
     content_type: ?[]const u8,
     proxy: ?[]const u8,
 ) !HttpResponseWithHeaders {
+    return httpRequestWithStatusAndHeadersTimed(allocator, method, url, body, headers, content_type, proxy, 0);
+}
+
+/// Apply an INACTIVITY ceiling to the request's underlying socket.
+///
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` bound each blocking socket operation, not the
+/// whole transfer — which is exactly the idle-vs-wall separation the agent
+/// loop needs: a provider that is COMPUTING a buffered completion sends no
+/// bytes and is indistinguishable from a dead socket, so the caller passes a
+/// ceiling sized to the longest wait it is willing to attribute to compute,
+/// while a streaming response only has to keep bytes moving. Before this,
+/// `timeout_secs` was accepted at every layer and enforced at none (`_ =
+/// timeout_secs` in the provider helper), so a stalled provider socket held a
+/// turn until an external clock killed the process — measured as HBENCH S5:
+/// the runner NEVER abandoned a dead-stall socket.
+fn applySocketTimeout(req: *std.http.Client.Request, timeout_secs: u64) void {
+    if (timeout_secs == 0) return;
+    const conn = req.connection orelse return;
+    const handle = conn.stream_reader.stream.socket.handle;
+    const bounded: i64 = @intCast(@min(timeout_secs, 86_400));
+    const tv = std.posix.timeval{ .sec = @intCast(bounded), .usec = 0 };
+    // Best-effort on purpose: a socket that refuses the option still carries
+    // the request; it just keeps the pre-existing unbounded behaviour.
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+pub fn httpRequestWithStatusAndHeadersTimed(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+    timeout_secs: u64,
+) !HttpResponseWithHeaders {
     var header_buf: [20]std.http.Header = undefined;
     var header_count: usize = 0;
     if (content_type) |ct| {
@@ -386,6 +423,7 @@ pub fn httpRequestWithStatusAndHeaders(
         .extra_headers = header_buf[0..header_count],
     });
     defer req.deinit();
+    applySocketTimeout(&req, timeout_secs);
 
     if (body) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
@@ -469,6 +507,23 @@ pub fn httpPostJsonWithProxy(
     proxy: ?[]const u8,
 ) ![]u8 {
     return httpRequest(allocator, .POST, url, body, headers, "application/json", proxy);
+}
+
+/// POST with a socket inactivity ceiling (see `applySocketTimeout`).
+/// `timeout_secs == 0` keeps the unbounded behaviour.
+pub fn httpPostJsonWithProxyTimed(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    timeout_secs: u64,
+) ![]u8 {
+    const resp = try httpRequestWithStatusAndHeadersTimed(allocator, .POST, url, body, headers, "application/json", proxy, timeout_secs);
+    allocator.free(resp.headers);
+    errdefer allocator.free(resp.body);
+    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    return resp.body;
 }
 
 pub fn httpGetWithProxy(

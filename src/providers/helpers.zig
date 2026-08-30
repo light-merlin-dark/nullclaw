@@ -502,7 +502,6 @@ pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
         error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
@@ -510,7 +509,12 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     defer if (resolve_entry) |entry| allocator.free(entry);
     // Provider requests often carry Authorization/x-api-key credentials.
     // Use std.http so secrets are never exposed through child process argv.
-    return http_util.httpPostJsonWithProxy(allocator, url, body, headers, null);
+    //
+    // `timeout_secs` is ENFORCED as a socket inactivity ceiling. It was
+    // accepted-and-discarded here for the fork's whole life (`_ =
+    // timeout_secs`), which is why a dead-stall provider socket held a turn
+    // until the external clock killed the process (HBENCH S5, 2026-08-30).
+    return http_util.httpPostJsonWithProxyTimed(allocator, url, body, headers, null, timeout_secs);
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
