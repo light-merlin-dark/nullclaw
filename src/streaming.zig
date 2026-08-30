@@ -67,24 +67,37 @@ pub const TagFilter = struct {
 
     // Opening tag prefixes. After matching, skip until '>'.
     // Handles canonical XML tags plus provider-specific *_begin wrappers.
+    // NOTE: matched by EXACT equality (`matchesAnyPrefix`), never by
+    // `startsWith` — so a plural form needs its own entry beside the singular,
+    // and `<tool_calls>` streamed through verbatim until one was added.
     const open_prefixes = [_][]const u8{
         "<tool_call",
+        "<tool_calls",
         "<tool_result",
         "<tool_call_begin",
         "<tool_result_begin",
         "<|tool_call_begin|",
         "<|tool_result_begin|",
+        // DeepSeek's DSML dialect. The bars are U+FF5C, not ASCII `|`, so the
+        // entries above cannot see it: the block was echoed to the user
+        // verbatim while the dispatcher failed to parse it — the two halves of
+        // one defect.
+        "<\u{ff5c}DSML\u{ff5c}tool_call",
+        "<\u{ff5c}DSML\u{ff5c}tool_calls",
         "<think",
     };
 
     // Closing tags (fixed match).
     const close_tags = [_][]const u8{
         "</tool_call>",
+        "</tool_calls>",
         "</tool_result>",
         "<tool_call_end>",
         "<tool_result_end>",
         "<|tool_call_end|>",
         "<|tool_result_end|>",
+        "<\u{ff5c}DSML\u{ff5c}/tool_call>",
+        "<\u{ff5c}DSML\u{ff5c}/tool_calls>",
         "</think>",
     };
 
@@ -463,6 +476,37 @@ test "TagFilter strips complete tool_call in single chunk" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Hi  bye", col.joined(&buf));
+}
+
+test "TagFilter strips a DSML tool_call block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("I'll check. <\u{ff5c}DSML\u{ff5c}tool_call>\nmcp_granis_invoke\n{\"command\":\"x\"}\n<\u{ff5c}DSML\u{ff5c}/tool_call> done");
+    s.emitFinal();
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("I'll check.  done", col.joined(&buf));
+}
+
+test "TagFilter strips a DSML block split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<\u{ff5c}DSML\u{ff5c}tool_c");
+    s.emitChunk("all>body<\u{ff5c}DSML\u{ff5c}/tool_call>B");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter strips a tool_calls container instead of swallowing the reply" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Checking now. <tool_calls><invoke name=\"granis_tasks_list\"></invoke></tool_calls> and here is the answer.");
+    s.emitFinal();
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("Checking now.  and here is the answer.", col.joined(&buf));
 }
 
 test "TagFilter strips tool_result with attributes" {

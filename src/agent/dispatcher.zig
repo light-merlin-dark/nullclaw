@@ -101,16 +101,286 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// DeepSeek's DSML tool-call dialect prefixes every token with a fullwidth
+/// vertical bar (U+FF5C): `<｜DSML｜tool_call>` … `<｜DSML｜/tool_call>`.
+///
+/// Those bytes are `EF BD 9C`, so an ASCII scan for `<tool_call>` matches
+/// nothing in a DSML block — the model called the right tool, the runner never
+/// saw it, and the raw markup reached the reply text verbatim.
+const DSML_PREFIX = "<\u{ff5c}DSML\u{ff5c}";
+
+/// The plural container dialect: `<tool_calls>` … `</tool_calls>`, wrapping one
+/// or more `<invoke name="…">` elements, nested `<tool_call>` blocks, or a JSON
+/// array. `indexOf("<tool_call>")` cannot see it either — the `s` defeats the
+/// literal — so it went out to a customer as markup on 2026-08-26.
+const TOOL_CALLS_OPEN = "<tool_calls>";
+const TOOL_CALLS_CLOSE = "</tool_calls>";
+
 /// Detect whether the response contains explicit tool-call markup tags.
 /// Used by the agent loop to avoid leaking raw tool XML-like payloads to users
 /// when parsing fails on malformed inner content.
 pub fn containsToolCallMarkup(text: []const u8) bool {
     return std.mem.indexOf(u8, text, "<tool_call>") != null or
         std.mem.indexOf(u8, text, "</tool_call>") != null or
+        std.mem.indexOf(u8, text, TOOL_CALLS_OPEN) != null or
+        std.mem.indexOf(u8, text, TOOL_CALLS_CLOSE) != null or
+        std.mem.indexOf(u8, text, DSML_PREFIX) != null or
         std.mem.indexOf(u8, text, "[TOOL_CALL]") != null or
         std.mem.indexOf(u8, text, "[tool_call]") != null or
         std.mem.indexOf(u8, text, "[/TOOL_CALL]") != null or
         std.mem.indexOf(u8, text, "[/tool_call]") != null;
+}
+
+/// A DSML token: the whole tag (`<｜DSML｜…>`) and its body between the prefix
+/// and the closing `>`.
+const DsmlTag = struct {
+    len: usize,
+    body: []const u8,
+};
+
+fn readDsmlTag(text: []const u8, idx: usize) ?DsmlTag {
+    if (!std.mem.startsWith(u8, text[idx..], DSML_PREFIX)) return null;
+    const after = text[idx + DSML_PREFIX.len ..];
+    const gt = std.mem.indexOfScalar(u8, after, '>') orelse return null;
+    return .{ .len = DSML_PREFIX.len + gt + 1, .body = after[0..gt] };
+}
+
+const DsmlOpen = struct {
+    start: usize,
+    tag_len: usize,
+    container: bool,
+};
+
+/// Find the first DSML *opening* tool-call token. Matched by family rather than
+/// by one literal, so `<｜DSML｜tool_call>` and `<｜DSML｜tool_calls>` both land.
+fn findDsmlOpen(text: []const u8) ?DsmlOpen {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, DSML_PREFIX)) |idx| {
+        if (readDsmlTag(text, idx)) |tag| {
+            const body = std.mem.trim(u8, tag.body, " \t\r\n");
+            if (body.len > 0 and body[0] != '/' and containsIgnoreCase(body, "tool_call")) {
+                return .{
+                    .start = idx,
+                    .tag_len = tag.len,
+                    .container = containsIgnoreCase(body, "tool_calls"),
+                };
+            }
+            search = idx + tag.len;
+        } else {
+            search = idx + DSML_PREFIX.len;
+        }
+    }
+    return null;
+}
+
+const CloseMarker = struct { at: usize, len: usize };
+
+/// Find the closing marker for a DSML block. Accepts the DSML close token and
+/// the plain ASCII closers models mix into the same message; whichever comes
+/// first wins, so a mixed block still terminates where the model meant it to.
+fn findDsmlClose(body: []const u8) ?CloseMarker {
+    var best: ?CloseMarker = null;
+
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, body, search, DSML_PREFIX)) |idx| {
+        if (readDsmlTag(body, idx)) |tag| {
+            const t = std.mem.trim(u8, tag.body, " \t\r\n");
+            if (t.len > 0 and t[0] == '/' and containsIgnoreCase(t, "tool_call")) {
+                best = .{ .at = idx, .len = tag.len };
+                break;
+            }
+            search = idx + tag.len;
+        } else {
+            search = idx + DSML_PREFIX.len;
+        }
+    }
+
+    for ([_][]const u8{ TOOL_CALLS_CLOSE, "</tool_call>" }) |closer| {
+        if (std.mem.indexOf(u8, body, closer)) |at| {
+            if (best == null or at < best.?.at) best = .{ .at = at, .len = closer.len };
+        }
+    }
+
+    return best;
+}
+
+/// A tool-call block written in a dialect with an EXPLICIT close marker
+/// (DeepSeek DSML, or the `<tool_calls>` container), as opposed to the ASCII
+/// `<tool_call>` scan's flexible closing-tag search.
+const DialectBlock = struct {
+    start: usize,
+    body_start: usize,
+    body_end: usize,
+    block_end: usize,
+    closed: bool,
+    container: bool,
+};
+
+/// Find the earliest dialect block in `text`, if any.
+fn findDialectBlock(text: []const u8) ?DialectBlock {
+    var chosen: ?DialectBlock = null;
+
+    if (findDsmlOpen(text)) |open| {
+        const body_start = open.start + open.tag_len;
+        if (findDsmlClose(text[body_start..])) |close| {
+            chosen = .{
+                .start = open.start,
+                .body_start = body_start,
+                .body_end = body_start + close.at,
+                .block_end = body_start + close.at + close.len,
+                .closed = true,
+                .container = open.container,
+            };
+        } else {
+            chosen = .{
+                .start = open.start,
+                .body_start = body_start,
+                .body_end = text.len,
+                .block_end = text.len,
+                .closed = false,
+                .container = open.container,
+            };
+        }
+    }
+
+    if (std.mem.indexOf(u8, text, TOOL_CALLS_OPEN)) |start| {
+        if (chosen == null or start < chosen.?.start) {
+            const body_start = start + TOOL_CALLS_OPEN.len;
+            if (std.mem.indexOf(u8, text[body_start..], TOOL_CALLS_CLOSE)) |rel| {
+                chosen = .{
+                    .start = start,
+                    .body_start = body_start,
+                    .body_end = body_start + rel,
+                    .block_end = body_start + rel + TOOL_CALLS_CLOSE.len,
+                    .closed = true,
+                    .container = true,
+                };
+            } else {
+                chosen = .{
+                    .start = start,
+                    .body_start = body_start,
+                    .body_end = text.len,
+                    .block_end = text.len,
+                    .closed = false,
+                    .container = true,
+                };
+            }
+        }
+    }
+
+    return chosen;
+}
+
+/// Append every call found in a JSON array of call objects.
+fn appendJsonArrayCalls(
+    allocator: std.mem.Allocator,
+    calls: *std.ArrayListUnmanaged(ParsedToolCall),
+    src: []const u8,
+) std.mem.Allocator.Error!usize {
+    const array_src = extractJsonObject(src) orelse return 0;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, array_src, .{}) catch return 0;
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return 0,
+    };
+
+    var appended: usize = 0;
+    for (arr.items) |item| {
+        switch (item) {
+            .object => {},
+            else => continue,
+        }
+        const item_json = std.json.Stringify.valueAlloc(allocator, item, .{}) catch continue;
+        defer allocator.free(item_json);
+        if (parseToolCallJson(allocator, item_json)) |call| {
+            try calls.append(allocator, call);
+            appended += 1;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    }
+    return appended;
+}
+
+/// Parse the body of a dialect block and append what it holds.
+///
+/// Returns the number of calls appended; **zero means nothing was dispatched**.
+/// A body that only partly parses appends only what parsed cleanly and never a
+/// half-built call, so a malformed block fails closed rather than firing a tool
+/// with invented arguments.
+fn appendDialectBodyCalls(
+    allocator: std.mem.Allocator,
+    calls: *std.ArrayListUnmanaged(ParsedToolCall),
+    body: []const u8,
+    container: bool,
+) std.mem.Allocator.Error!usize {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return 0;
+
+    if (container) {
+        // 1. `<invoke name="…">` elements — one call each.
+        const invoke_prefix = "<invoke name=";
+        if (std.mem.indexOf(u8, trimmed, invoke_prefix) != null) {
+            var appended: usize = 0;
+            var rest = trimmed;
+            const invoke_close = "</invoke>";
+            while (std.mem.indexOf(u8, rest, invoke_prefix)) |inv| {
+                const segment_src = rest[inv..];
+                const segment_len = if (std.mem.indexOf(u8, segment_src, invoke_close)) |ic|
+                    ic + invoke_close.len
+                else
+                    segment_src.len;
+                if (parseInvokeTagCall(allocator, segment_src[0..segment_len])) |call| {
+                    try calls.append(allocator, call);
+                    appended += 1;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+                rest = segment_src[segment_len..];
+            }
+            if (appended > 0) return appended;
+        }
+
+        // 2. Nested blocks in any dialect the primary parser understands.
+        //    The body always excludes its own opening marker, so this recursion
+        //    is strictly decreasing and terminates.
+        if (containsToolCallMarkup(trimmed)) {
+            const nested = try parseXmlToolCalls(allocator, trimmed);
+            allocator.free(nested.text);
+            defer allocator.free(nested.calls);
+            if (nested.calls.len > 0) {
+                calls.ensureUnusedCapacity(allocator, nested.calls.len) catch {
+                    for (nested.calls) |c| {
+                        allocator.free(c.name);
+                        allocator.free(c.arguments_json);
+                        if (c.tool_call_id) |id| allocator.free(id);
+                    }
+                    return error.OutOfMemory;
+                };
+                for (nested.calls) |c| calls.appendAssumeCapacity(c);
+                return nested.calls.len;
+            }
+        }
+
+        // 3. A JSON array of call objects.
+        if (trimmed[0] == '[') {
+            const appended = try appendJsonArrayCalls(allocator, calls, trimmed);
+            if (appended > 0) return appended;
+        }
+    }
+
+    // 4. A single call, in every inner form the `<tool_call>` parser already
+    //    understands — including DSML's `name\n{arguments}` shape.
+    if (try parseInnerToolCall(allocator, trimmed)) |call| {
+        try calls.append(allocator, call);
+        return 1;
+    }
+
+    return 0;
 }
 
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
@@ -148,6 +418,11 @@ pub fn parseXmlToolCalls(
     var remaining = response;
 
     while (true) {
+        // Dialect blocks (DeepSeek DSML, the `<tool_calls>` container) carry an
+        // explicit close marker, so they are matched separately from the ASCII
+        // scan below. Whichever opens FIRST in the remaining text wins.
+        const dialect = findDialectBlock(remaining);
+
         // Find next tool call marker: either <tool_call> or [TOOL_CALL] or [tool_call]
         const marker_info: ?struct { start: usize, end: usize, open_char: u8, close_char: u8 } = blk: {
             const xml_start = std.mem.indexOf(u8, remaining, "<tool_call>");
@@ -182,6 +457,38 @@ pub fn parseXmlToolCalls(
             }
             break :blk null;
         };
+
+        if (dialect) |block| {
+            const legacy_start: ?usize = if (marker_info) |m| m.start else null;
+            if (legacy_start == null or block.start < legacy_start.?) {
+                const before = std.mem.trim(u8, remaining[0..block.start], " \t\r\n");
+                if (before.len > 0) try text_parts.append(allocator, before);
+
+                const appended = try appendDialectBodyCalls(
+                    allocator,
+                    &calls,
+                    remaining[block.body_start..block.body_end],
+                    block.container,
+                );
+
+                if (block.closed) {
+                    // Parsed or not, the block itself is consumed: raw dialect
+                    // markup must never survive into user-visible text.
+                    remaining = remaining[block.block_end..];
+                    continue;
+                }
+
+                // Unclosed and unparseable: keep the payload so the agent loop's
+                // `containsToolCallMarkup` guard suppresses it rather than
+                // showing a customer a half-written tool call.
+                if (appended == 0) {
+                    const unresolved = std.mem.trim(u8, remaining, " \t\r\n");
+                    if (unresolved.len > 0) try text_parts.append(allocator, unresolved);
+                }
+                remaining = "";
+                break;
+            }
+        }
 
         if (marker_info == null) break;
         const info = marker_info.?;
@@ -1444,6 +1751,182 @@ fn parseNamePrefixedJsonCall(allocator: std.mem.Allocator, inner: []const u8) !P
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ── Model-native dialects: DeepSeek DSML and the `<tool_calls>` container ──
+//
+// Both shapes were measured reaching production as literal text in a reply
+// (`<｜DSML｜tool_call>` on the DeepSeek baseline, `<tool_calls><invoke …>` on
+// 2026-08-26) because the marker scan only knew the ASCII `<tool_call>` form.
+
+/// Free a ParseResult the way every test in this file does.
+fn freeParseResult(allocator: std.mem.Allocator, result: ParseResult) void {
+    allocator.free(result.text);
+    for (result.calls) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+        if (call.tool_call_id) |id| allocator.free(id);
+    }
+    allocator.free(result.calls);
+}
+
+test "parseToolCalls dispatches a DSML block with a name-prefixed body" {
+    const allocator = std.testing.allocator;
+    const response = "I'll check the persisted state.\n" ++
+        "<\u{ff5c}DSML\u{ff5c}tool_call>\n" ++
+        "mcp_granis_invoke\n" ++
+        "{\"command\": \"granis email drafts\"}\n" ++
+        "<\u{ff5c}DSML\u{ff5c}/tool_call>";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("mcp_granis_invoke", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "granis email drafts") != null);
+    try std.testing.expectEqualStrings("I'll check the persisted state.", result.text);
+    try std.testing.expect(!containsToolCallMarkup(result.text));
+}
+
+test "parseToolCalls dispatches a DSML block carrying a full JSON envelope" {
+    const allocator = std.testing.allocator;
+    const response = "<\u{ff5c}DSML\u{ff5c}tool_call>" ++
+        "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls -la\"}}" ++
+        "<\u{ff5c}DSML\u{ff5c}/tool_call>";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ls -la") != null);
+}
+
+test "parseToolCalls dispatches a tool_calls container of invoke elements" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\Checking now.
+        \\<tool_calls><invoke name="granis_tasks_list"><parameter name="status">open</parameter></invoke></tool_calls>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("granis_tasks_list", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "open") != null);
+    try std.testing.expectEqualStrings("Checking now.", result.text);
+}
+
+test "parseToolCalls dispatches every invoke in a tool_calls container" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_calls>
+        \\<invoke name="file_read"><parameter name="path">a.txt</parameter></invoke>
+        \\<invoke name="file_read"><parameter name="path">b.txt</parameter></invoke>
+        \\</tool_calls>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[1].arguments_json, "b.txt") != null);
+}
+
+test "parseToolCalls dispatches nested tool_call blocks inside a container" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_calls>
+        \\<tool_call>
+        \\{"name": "file_read", "arguments": {"path": "a.txt"}}
+        \\</tool_call>
+        \\</tool_calls>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("file_read", result.calls[0].name);
+    try std.testing.expect(!containsToolCallMarkup(result.text));
+}
+
+test "parseToolCalls dispatches a JSON array inside a tool_calls container" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_calls>[{"name": "file_read", "arguments": {"path": "a.txt"}}, {"name": "shell", "arguments": {"command": "ls"}}]</tool_calls>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("file_read", result.calls[0].name);
+    try std.testing.expectEqualStrings("shell", result.calls[1].name);
+}
+
+test "parseToolCalls keeps the ASCII tool_call format working beside the dialects" {
+    const allocator = std.testing.allocator;
+    const response = "Before.\n" ++
+        "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>\n" ++
+        "<\u{ff5c}DSML\u{ff5c}tool_call>\nfile_read\n{\"path\": \"a.txt\"}\n<\u{ff5c}DSML\u{ff5c}/tool_call>";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expectEqualStrings("file_read", result.calls[1].name);
+    try std.testing.expectEqualStrings("Before.", result.text);
+}
+
+test "a malformed DSML block dispatches nothing and leaks no markup" {
+    const allocator = std.testing.allocator;
+    const response = "Checking now.\n" ++
+        "<\u{ff5c}DSML\u{ff5c}tool_call>\n" ++
+        "not a tool call at all, just prose\n" ++
+        "<\u{ff5c}DSML\u{ff5c}/tool_call>";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+    try std.testing.expect(!containsToolCallMarkup(result.text));
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "DSML") == null);
+}
+
+test "an unclosed DSML block dispatches nothing and is suppressed by the markup guard" {
+    const allocator = std.testing.allocator;
+    const response = "Checking now.\n" ++
+        "<\u{ff5c}DSML\u{ff5c}tool_call>\n" ++
+        "half a thought and then the stream ended";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+    // The payload is retained ONLY so the agent loop's guard blanks it.
+    try std.testing.expect(containsToolCallMarkup(result.text));
+}
+
+test "an unclosed DSML block still recovers a well-formed compact call" {
+    const allocator = std.testing.allocator;
+    const response = "<\u{ff5c}DSML\u{ff5c}tool_call>\nfile_read\n{\"path\": \"a.txt\"}";
+
+    const result = try parseToolCalls(allocator, response);
+    defer freeParseResult(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("file_read", result.calls[0].name);
+}
+
+test "containsToolCallMarkup recognizes the DSML and container dialects" {
+    try std.testing.expect(containsToolCallMarkup("<\u{ff5c}DSML\u{ff5c}tool_call>"));
+    try std.testing.expect(containsToolCallMarkup("<tool_calls>"));
+    try std.testing.expect(containsToolCallMarkup("</tool_calls>"));
+    try std.testing.expect(!containsToolCallMarkup("an ordinary sentence about tools"));
+}
 
 test "parseToolCalls extracts single call" {
     const allocator = std.testing.allocator;

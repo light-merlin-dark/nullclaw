@@ -547,7 +547,15 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
         for (tool_defs, 0..) |td, idx| {
             var wrapper = try allocator.create(McpToolWrapper);
             errdefer allocator.destroy(wrapper);
-            const prefixed_name = try std.fmt.allocPrint(allocator, "mcp_{s}_{s}", .{ cfg.name, td.name });
+            // Avoid double-prefixing when the MCP server already namespaces tools
+            // with the server name (e.g. server "granis" returning "granis_drive_list").
+            const already_namespaced = std.mem.startsWith(u8, td.name, cfg.name) and
+                td.name.len > cfg.name.len and
+                td.name[cfg.name.len] == '_';
+            const prefixed_name = if (already_namespaced)
+                try std.fmt.allocPrint(allocator, "mcp_{s}", .{td.name})
+            else
+                try std.fmt.allocPrint(allocator, "mcp_{s}_{s}", .{ cfg.name, td.name });
             errdefer allocator.free(prefixed_name);
             wrapper.* = .{
                 .allocator = allocator,
