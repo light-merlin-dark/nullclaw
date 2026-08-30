@@ -295,6 +295,10 @@ pub const Agent = struct {
     auto_disable_vision_on_error: bool = true,
     /// Models auto-detected as not supporting vision (built at runtime).
     detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// See AgentConfig.final_commit_marker: when set, a non-empty no-tool-call
+    /// reply before any marker-matching dispatched call gets a bounded SYSTEM
+    /// follow-up instead of ending the turn.
+    final_commit_marker: ?[]const u8 = null,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -610,6 +614,7 @@ pub const Agent = struct {
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
             .vision_disabled_models = cfg.agent.vision_disabled_models,
             .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
+            .final_commit_marker = cfg.agent.final_commit_marker,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -944,6 +949,18 @@ pub const Agent = struct {
         // never show the raw payload to the user.
         if (dispatcher.containsToolCallMarkup(response_text)) return "";
         return response_text;
+    }
+
+    /// Whether a dispatched tool call satisfies the configured terminal-commit
+    /// marker. Matched against BOTH the tool name and the raw arguments JSON,
+    /// because a lane that funnels every command through one tool (e.g. an
+    /// `invoke {command: ...}` CLI surface) carries the commit's name only in
+    /// the arguments. An attempted commit counts even if the tool result was a
+    /// refusal — nudging a model that already tried the commit adds nothing.
+    fn toolCallMatchesCommitMarker(marker: []const u8, name: []const u8, arguments_json: []const u8) bool {
+        if (marker.len == 0) return false;
+        return std.mem.indexOf(u8, name, marker) != null or
+            std.mem.indexOf(u8, arguments_json, marker) != null;
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -2171,6 +2188,11 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
+        // True once any tool call matching final_commit_marker was dispatched
+        // this turn. Until then, a no-tool-call reply is premature for lanes
+        // that configure the marker (their contract ends the turn with a
+        // terminal commit tool call, never prose).
+        var terminal_commit_dispatched = false;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
@@ -2565,6 +2587,33 @@ pub const Agent = struct {
                     return error.NoResponseContent;
                 }
 
+                // Structural guardrail (final_commit_marker lanes): the lane's
+                // contract says a turn ends with a terminal commit TOOL CALL,
+                // never prose — so a non-empty reply with no tool call before
+                // any commit attempt is premature whatever its wording. This
+                // is deliberately not a phrase heuristic: the measured failure
+                // (EM-1309 canary, 2026-08-29) was "I'll extract the content
+                // from these invoice PDFs…" ending the turn because "extract"
+                // was not on the phrase list below.
+                if (self.final_commit_marker) |marker| {
+                    if (!terminal_commit_dispatched and
+                        forced_follow_through_count < 2 and
+                        iteration + 1 < self.max_tool_iterations)
+                    {
+                        try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
+                        const nudge = try std.fmt.allocPrint(
+                            self.allocator,
+                            "SYSTEM: You ended your reply without any tool call, but this turn has not yet committed its reply through {s}. Prose alone does not complete the turn and is never delivered. Either issue the next tool call now, or call {s} now with what you already have. Never end with an announcement of what you will do.",
+                            .{ marker, marker },
+                        );
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
+                        self.trimHistory();
+                        self.freeResponseFields(&response);
+                        forced_follow_through_count += 1;
+                        continue;
+                    }
+                }
+
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
@@ -2720,6 +2769,14 @@ pub const Agent = struct {
                 if (self.isInterruptRequested()) {
                     self.freeResponseFields(&response);
                     return self.interruptedReply();
+                }
+
+                if (self.final_commit_marker) |marker| {
+                    if (!terminal_commit_dispatched and
+                        toolCallMatchesCommitMarker(marker, call.name, call.arguments_json))
+                    {
+                        terminal_commit_dispatched = true;
+                    }
                 }
 
                 if (self.log_tool_calls) {
@@ -9726,6 +9783,25 @@ test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me fetch the list of projects."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me look up the tasks now."));
+}
+
+test "Agent toolCallMatchesCommitMarker matches name and arguments" {
+    // Direct tool name match.
+    try std.testing.expect(Agent.toolCallMatchesCommitMarker("email_compose_reply", "email_compose_reply", "{}"));
+    // A CLI-funnel lane carries the commit only in the arguments.
+    try std.testing.expect(Agent.toolCallMatchesCommitMarker(
+        "email_compose_reply",
+        "mcp_granis_invoke",
+        "{\"command\": \"email_compose_reply --reply-text ...\"}",
+    ));
+    // A work call is not a commit.
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(
+        "email_compose_reply",
+        "mcp_granis_invoke",
+        "{\"command\": \"email_providers_intake_extract_attachment --id abc\"}",
+    ));
+    // Empty marker never matches (guard against a misconfigured empty string).
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker("", "email_compose_reply", "{}"));
 }
 
 test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {

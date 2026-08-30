@@ -441,6 +441,15 @@ pub const AgentConfig = struct {
     auto_disable_vision_on_error: bool = true,
     /// Redact PII in outbound provider messages for the root agent.
     enable_pii_redaction: bool = true,
+    /// When set, a non-empty assistant reply carrying no tool call does not
+    /// end the turn unless a tool call whose name or arguments contain this
+    /// marker was already dispatched in the same turn. Instead the agent
+    /// injects a bounded SYSTEM follow-up (shares the forced-follow-through
+    /// budget) telling the model to continue or commit. Lanes whose contract
+    /// requires a terminal commit tool (e.g. a response-proposal contract)
+    /// set this to that tool's name; all other lanes leave it null and keep
+    /// the phrase-based follow-through heuristic alone.
+    final_commit_marker: ?[]const u8 = null,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
