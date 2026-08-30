@@ -1791,6 +1791,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("enable_pii_redaction")) |v| {
                 if (v == .bool) self.agent.enable_pii_redaction = v.bool;
             }
+            if (ag.object.get("final_commit_marker")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    self.agent.final_commit_marker = try self.allocator.dupe(u8, v.string);
+                }
+            }
             if (ag.object.get("default_queue_mode")) |v| {
                 if (v != .string) return error.InvalidDefaultQueueMode;
                 self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse

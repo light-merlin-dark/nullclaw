@@ -1365,6 +1365,7 @@ pub const Config = struct {
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
             .enable_pii_redaction = self.agent.enable_pii_redaction,
+            .final_commit_marker = self.agent.final_commit_marker,
         }, ",\n");
 
         // Channels
