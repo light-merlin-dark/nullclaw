@@ -3027,9 +3027,19 @@ pub const Agent = struct {
                 const tool_timer = std_compat.time.milliTimestamp();
                 const result = blk: {
                     if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
+                        // The full result already sits in history from the
+                        // first execution — replaying the cached bytes
+                        // re-appends them on EVERY duplicate, so a model that
+                        // re-requests a large result balloons its own request
+                        // (measured 2026-08-31, EM-85: a 74 KB work-order
+                        // result re-injected on 4 duplicates grew the provider
+                        // request to 526 KB and the gateway refused dispatch).
+                        // A duplicate is answered with a short pointer;
+                        // success/outcome are preserved so the terminal state
+                        // machine still sees the truth of the original call.
                         break :blk ToolExecutionResult{
                             .name = call.name,
-                            .output = cached_result.output,
+                            .output = "Duplicate tool call: this exact call already ran earlier in this turn and its full result is already in the conversation above. Do not repeat tool calls — use the result you already have.",
                             .success = cached_result.success,
                             .tool_call_id = call.tool_call_id,
                             .outcome = cached_result.outcome,
@@ -10217,6 +10227,29 @@ const TerminalCommitLaneHarness = struct {
         }
     };
 
+    /// Sentinel unique to BigOutputProbeTool's result body.
+    const BIG_OUTPUT_SENTINEL = "WORK_ORDER_RESULT_BODY_MARKER";
+
+    /// A work tool with a distinctive (stand-in for large) output body, for
+    /// asserting how many times the body itself lands in history.
+    const BigOutputProbeTool = struct {
+        const Self = @This();
+        calls: usize = 0,
+        pub const tool_name = "probe_big";
+        pub const tool_description = "scripted big-output probe";
+        pub const tool_params = "{\"type\":\"object\"}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.calls += 1;
+            return .{ .success = true, .output = "WORK_ORDER_RESULT_BODY_MARKER: 771 candidates staged." };
+        }
+    };
+
     /// A non-terminal work tool that always succeeds.
     const ScriptedProbeTool = struct {
         const Self = @This();
@@ -10599,6 +10632,40 @@ test "Agent not-attempted exhaustion whose reserved completion proses fails clos
     try std.testing.expectEqual(@as(usize, 2), probe_impl.calls);
     try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
     try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.EXHAUSTION_NUDGE_SENTINEL));
+}
+
+test "Agent duplicate tool call replays a short pointer, not the full cached output" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    // The same probe call twice (identical name + arguments, no provider ids
+    // — the XML-dialect shape the live head produces, which dedups on the
+    // name+arguments signature), then a wrap-up.
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "", .name = "probe_big", .arguments = "{\"n\":1}" }} },
+        .{ .calls = &.{.{ .id = "", .name = "probe_big", .arguments = "{\"n\":1}" }} },
+        .{ .prose = "done" },
+    } };
+    var probe_impl = H.BigOutputProbeTool{};
+    const tool_list = [_]Tool{probe_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.final_commit_marker = null;
+    defer agent.deinit();
+
+    const response = try agent.turn("run the probe twice");
+    defer allocator.free(response);
+
+    // The tool executed once; the duplicate was answered from the turn cache.
+    try std.testing.expectEqual(@as(usize, 1), probe_impl.calls);
+    // The full result body enters history exactly ONCE — the duplicate replay
+    // appends a short pointer instead of re-buying the same bytes (measured
+    // 2026-08-31, EM-85 Gate B'' run 3: a 74 KB work-order result re-injected
+    // on every duplicate ballooned the provider request to 526 KB and the
+    // gateway refused dispatch).
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.BIG_OUTPUT_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, "Duplicate tool call"));
 }
 
 test "Agent without commit marker keeps summary behavior at iteration exhaustion" {
