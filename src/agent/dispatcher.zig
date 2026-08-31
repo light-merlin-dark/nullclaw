@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const providers = @import("../providers/root.zig");
+const tools_mod = @import("../tools/root.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Dispatcher — tool call parsing and result formatting
@@ -65,6 +66,10 @@ pub const ToolExecutionResult = struct {
     output: []const u8,
     success: bool,
     tool_call_id: ?[]const u8 = null,
+    /// Typed acknowledgement carried through from ToolResult (see
+    /// tools.ToolOutcome): `.refused` = server executed and refused
+    /// (definitive), `.transport_failed` = server-side effect unknown.
+    outcome: tools_mod.ToolOutcome = .ok,
 };
 
 /// Parse tool calls from an LLM response.
@@ -1247,12 +1252,22 @@ pub fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         try buf.append(allocator, '"');
     }
 
-    // Step 3: Balance braces and brackets
-    var brace_depth: i32 = 0;
-    var bracket_depth: i32 = 0;
+    // Step 3: Balance braces and brackets with a delimiter stack.
+    // A closer that mismatches the innermost open delimiter is corrected in
+    // place to the expected closer — the single-character correction is
+    // unambiguous because JSON closers map one-to-one to their openers.
+    // Measured failure this repairs (Gate B, 2026-08-31): the model ended a
+    // still-open outer object with `]` instead of `}`, and depth counting
+    // alone left the stray `]` in place, losing the nested object/array shape.
+    // A closer with no open delimiter is left untouched, matching the old
+    // depth-count behavior for over-closed input. Missing closers are appended
+    // innermost-first (the old code appended all `]` before all `}`, which
+    // mis-closed mixed nesting like `["x", {"y": 1`).
+    var open_stack: std.ArrayListUnmanaged(u8) = .empty;
+    defer open_stack.deinit(allocator);
     var in_str = false;
     var esc3 = false;
-    for (buf.items) |c| {
+    for (buf.items, 0..) |c, idx| {
         if (esc3) {
             esc3 = false;
             continue;
@@ -1261,19 +1276,25 @@ pub fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             esc3 = true;
             continue;
         }
-        if (c == '"') in_str = !in_str;
-        if (!in_str) {
-            if (c == '{') brace_depth += 1;
-            if (c == '}') brace_depth -= 1;
-            if (c == '[') bracket_depth += 1;
-            if (c == ']') bracket_depth -= 1;
+        if (c == '"') {
+            in_str = !in_str;
+            continue;
+        }
+        if (in_str) continue;
+        switch (c) {
+            '{' => try open_stack.append(allocator, '}'),
+            '[' => try open_stack.append(allocator, ']'),
+            '}', ']' => {
+                if (open_stack.items.len == 0) continue;
+                const expected = open_stack.items[open_stack.items.len - 1];
+                if (c != expected) buf.items[idx] = expected;
+                open_stack.items.len -= 1;
+            },
+            else => {},
         }
     }
-    while (bracket_depth > 0) : (bracket_depth -= 1) {
-        try buf.append(allocator, ']');
-    }
-    while (brace_depth > 0) : (brace_depth -= 1) {
-        try buf.append(allocator, '}');
+    while (open_stack.pop()) |closer| {
+        try buf.append(allocator, closer);
     }
 
     return try buf.toOwnedSlice(allocator);
@@ -3145,6 +3166,62 @@ test "repairJson handles combined issues" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("test", parsed.value.object.get("name").?.string);
+}
+
+test "repairJson corrects wrong final closer preserving nested disposition arrays" {
+    const allocator = std.testing.allocator;
+    // Frozen from the 2026-08-31 Gate B transcript shape (content-safe
+    // synthetic values): the model ended the still-open outer object with `]`
+    // instead of `}`. Depth counting alone cannot repair this — the stray `]`
+    // survives and the nested object/array shape is lost.
+    const input =
+        "{\"body\": \"synthetic reply body\", " ++
+        "\"askDispositions\": [" ++
+        "{\"askId\": \"ask-1\", \"disposition\": \"answered\"}, " ++
+        "{\"askId\": \"ask-2\", \"disposition\": \"declined\"}], " ++
+        "\"workResultDispositions\": [" ++
+        "{\"workOrderId\": \"wo-1\", \"disposition\": \"delivered\"}]]";
+    const result = try repairJson(allocator, input);
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("synthetic reply body", root_obj.get("body").?.string);
+    const asks = root_obj.get("askDispositions").?.array;
+    try std.testing.expectEqual(@as(usize, 2), asks.items.len);
+    try std.testing.expectEqualStrings("ask-1", asks.items[0].object.get("askId").?.string);
+    try std.testing.expectEqualStrings("declined", asks.items[1].object.get("disposition").?.string);
+    const works = root_obj.get("workResultDispositions").?.array;
+    try std.testing.expectEqual(@as(usize, 1), works.items.len);
+    try std.testing.expectEqualStrings("wo-1", works.items[0].object.get("workOrderId").?.string);
+}
+
+test "parseToolCallJson preserves nested disposition arrays when envelope ends with bracket" {
+    const allocator = std.testing.allocator;
+    // Same Gate B failure, one level up: `arguments` closes correctly and the
+    // outer tool-call envelope closes with `]` instead of `}`.
+    const envelope =
+        "{\"name\": \"email_compose_reply\", \"arguments\": {" ++
+        "\"body\": \"synthetic reply body\", " ++
+        "\"askDispositions\": [{\"askId\": \"ask-1\", \"disposition\": \"answered\"}], " ++
+        "\"workResultDispositions\": [{\"workOrderId\": \"wo-1\", \"disposition\": \"delivered\"}]" ++
+        "}]";
+    const result = try parseToolCallJson(allocator, envelope);
+    defer {
+        allocator.free(result.name);
+        allocator.free(result.arguments_json);
+    }
+    try std.testing.expectEqualStrings("email_compose_reply", result.name);
+    const args = try std.json.parseFromSlice(std.json.Value, allocator, result.arguments_json, .{});
+    defer args.deinit();
+    const args_obj = args.value.object;
+    try std.testing.expectEqualStrings("synthetic reply body", args_obj.get("body").?.string);
+    const asks = args_obj.get("askDispositions").?.array;
+    try std.testing.expectEqual(@as(usize, 1), asks.items.len);
+    try std.testing.expectEqualStrings("ask-1", asks.items[0].object.get("askId").?.string);
+    const works = args_obj.get("workResultDispositions").?.array;
+    try std.testing.expectEqual(@as(usize, 1), works.items.len);
+    try std.testing.expectEqualStrings("delivered", works.items[0].object.get("disposition").?.string);
 }
 
 test "parseToolCallJson with trailing comma repair" {

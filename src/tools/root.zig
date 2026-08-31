@@ -132,6 +132,14 @@ pub const anonymize_text = @import("anonymize_text.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
+/// How a tool execution resolved with respect to remote side effects.
+/// Distinguishes a server that executed and refused (definitive — no remote
+/// effect happened) from a transport-level failure (ambiguous — the remote
+/// effect may or may not have landed; never replay). Cross-repo contract:
+/// a JSON-RPC-successful MCP tools/call with `result.isError: true` is
+/// `.refused`; HTTP/JSON-RPC/parse/stream failures are `.transport_failed`.
+pub const ToolOutcome = enum { ok, refused, transport_failed };
+
 /// Result of a tool execution.
 ///
 /// Ownership: both `output` and `error_msg` are owned by the tool that produced them.
@@ -145,6 +153,10 @@ pub const ToolResult = struct {
     output: []const u8,
     /// Heap-allocated error message owned by caller if non-null. Free with allocator.free().
     error_msg: ?[]const u8 = null,
+    /// Typed acknowledgement of what the failure means for remote effects.
+    /// `.ok` (default) covers success and purely local failures — no remote
+    /// side effect is in doubt. Transport-aware wrappers (MCP) refine it.
+    outcome: ToolOutcome = .ok,
 
     /// Create a success result with a static/literal output (do NOT free).
     pub fn ok(output: []const u8) ToolResult {

@@ -140,8 +140,10 @@ pub const McpServer = struct {
         return try parseToolsListResponse(self.allocator, resp);
     }
 
-    /// Call a specific tool on the MCP server.
-    pub fn callTool(self: *McpServer, tool_name: []const u8, args_json: []const u8) ![]const u8 {
+    /// Call a specific tool on the MCP server. Returns the concatenated text
+    /// content plus the server's `isError` flag, so callers can distinguish a
+    /// definitive server-side refusal from transport-level failure (errors).
+    pub fn callTool(self: *McpServer, tool_name: []const u8, args_json: []const u8) !CallToolOutcome {
         // Build params: {"name": "...", "arguments": ...}
         // Use proper JSON escaping for tool_name to prevent injection.
         var params_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -154,7 +156,7 @@ pub const McpServer = struct {
 
         const resp = try self.sendRequest(self.allocator, "tools/call", params_buf.items);
         defer self.allocator.free(resp);
-        return try parseCallToolResponse(self.allocator, resp);
+        return try parseCallToolOutcome(self.allocator, resp);
     }
 
     pub fn deinit(self: *McpServer) void {
@@ -389,7 +391,22 @@ pub fn parseToolsListResponse(allocator: Allocator, resp: []const u8) ![]McpTool
     return list.toOwnedSlice(allocator);
 }
 
+/// Parsed MCP tools/call result: the text content plus the spec's `isError`
+/// flag. `is_error=true` means the server EXECUTED the call and returned a
+/// typed refusal — transport succeeded, no server-side effect happened. It is
+/// deliberately not folded into an error: the refusal text must reach the
+/// model as the tool result so it can correct itself.
+pub const CallToolOutcome = struct {
+    text: []const u8,
+    is_error: bool,
+};
+
 pub fn parseCallToolResponse(allocator: Allocator, resp: []const u8) ![]const u8 {
+    const outcome = try parseCallToolOutcome(allocator, resp);
+    return outcome.text;
+}
+
+pub fn parseCallToolOutcome(allocator: Allocator, resp: []const u8) !CallToolOutcome {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
         return error.InvalidJson;
     defer parsed.deinit();
@@ -409,6 +426,13 @@ pub fn parseCallToolResponse(allocator: Allocator, resp: []const u8) ![]const u8
     const result = parsed.value.object.get("result") orelse return error.MissingResult;
     if (result != .object) return error.InvalidJson;
 
+    // MCP CallToolResult.isError: true = executed-and-refused. Anything but a
+    // literal boolean true (absent, null, non-bool) reads as not-an-error.
+    const is_error = if (result.object.get("isError")) |flag|
+        flag == .bool and flag.bool
+    else
+        false;
+
     const content = result.object.get("content") orelse return error.MissingResult;
     if (content != .array) return error.InvalidJson;
 
@@ -426,7 +450,7 @@ pub fn parseCallToolResponse(allocator: Allocator, resp: []const u8) ![]const u8
         try output.appendSlice(allocator, text_val.string);
     }
 
-    return output.toOwnedSlice(allocator);
+    return .{ .text = try output.toOwnedSlice(allocator), .is_error = is_error };
 }
 
 // ── McpToolWrapper — adapts MCP tool to Tool vtable ─────────────
@@ -459,12 +483,22 @@ pub const McpToolWrapper = struct {
         const args_json = std.json.Stringify.valueAlloc(allocator, json_val, .{}) catch
             return tools_mod.ToolResult.fail("Failed to serialize tool arguments");
         defer allocator.free(args_json);
-        const output = self.server.callTool(self.original_name, args_json) catch |err| {
+        const outcome = self.server.callTool(self.original_name, args_json) catch |err| {
+            // Transport-level failure (HTTP status, JSON-RPC error, parse
+            // failure, EndOfStream, curl): the call may or may not have
+            // executed server-side. Ambiguous — callers must never replay a
+            // side-effectful call on this outcome.
             const msg = std.fmt.allocPrint(allocator, "MCP tool '{s}' failed: {}", .{ self.original_name, err }) catch
-                return tools_mod.ToolResult.fail("MCP tool call failed");
-            return tools_mod.ToolResult{ .success = false, .output = "", .error_msg = msg };
+                return tools_mod.ToolResult{ .success = false, .output = "", .error_msg = "MCP tool call failed", .outcome = .transport_failed };
+            return tools_mod.ToolResult{ .success = false, .output = "", .error_msg = msg, .outcome = .transport_failed };
         };
-        return tools_mod.ToolResult{ .success = true, .output = output };
+        if (outcome.is_error) {
+            // The server executed the call and refused it (result.isError).
+            // Definitive: no server-side effect happened. The refusal text is
+            // the tool result so the model can correct itself.
+            return tools_mod.ToolResult{ .success = false, .output = outcome.text, .outcome = .refused };
+        }
+        return tools_mod.ToolResult{ .success = true, .output = outcome.text };
     }
 
     fn nameImpl(ptr: *anyopaque) []const u8 {
@@ -750,6 +784,41 @@ test "parseCallToolResponse error" {
 
 test "parseCallToolResponse invalid json" {
     try std.testing.expectError(error.InvalidJson, parseCallToolResponse(std.testing.allocator, "not json"));
+}
+
+test "parseCallToolOutcome reports isError true as definitive refusal with text" {
+    const resp =
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"REFUSED: synthetic typed refusal"}],"isError":true}}
+    ;
+    const outcome = try parseCallToolOutcome(std.testing.allocator, resp);
+    defer std.testing.allocator.free(outcome.text);
+    try std.testing.expect(outcome.is_error);
+    try std.testing.expectEqualStrings("REFUSED: synthetic typed refusal", outcome.text);
+}
+
+test "parseCallToolOutcome reports isError false and absent as success" {
+    const explicit_false =
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}
+    ;
+    const outcome_false = try parseCallToolOutcome(std.testing.allocator, explicit_false);
+    defer std.testing.allocator.free(outcome_false.text);
+    try std.testing.expect(!outcome_false.is_error);
+
+    const absent =
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}
+    ;
+    const outcome_absent = try parseCallToolOutcome(std.testing.allocator, absent);
+    defer std.testing.allocator.free(outcome_absent.text);
+    try std.testing.expect(!outcome_absent.is_error);
+}
+
+test "parseCallToolOutcome ignores non-boolean isError" {
+    const resp =
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}],"isError":"true"}}
+    ;
+    const outcome = try parseCallToolOutcome(std.testing.allocator, resp);
+    defer std.testing.allocator.free(outcome.text);
+    try std.testing.expect(!outcome.is_error);
 }
 
 test "McpToolWrapper vtable name" {

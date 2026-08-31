@@ -1002,12 +1002,34 @@ pub const Agent = struct {
             std.mem.indexOf(u8, arguments_json, marker) != null;
     }
 
+    /// Measured terminal-commit acknowledgement for final_commit_marker lanes.
+    /// Replaces the old dispatched boolean, which treated a registered-but-
+    /// refused commit as done and let the turn end with no commit (Gate B,
+    /// 2026-08-31). The transition is decided AFTER execution, from the typed
+    /// tool outcome:
+    ///   - success            → .committed (sticky: a later duplicate attempt,
+    ///                          whatever its result, never regresses it);
+    ///   - outcome .refused   → .definitively_refused — the server executed
+    ///     and refused, no commit happened; exactly one bounded corrective
+    ///     attempt is allowed inside the existing iteration budget. A purely
+    ///     local failure (outcome .ok with success=false: bad arguments,
+    ///     policy gate) counts the same way — nothing reached the server;
+    ///   - outcome .transport_failed → .ambiguous — the commit may or may not
+    ///     have landed server-side; never replay, fail the turn closed.
+    const TerminalCommitState = enum {
+        not_attempted,
+        definitively_refused,
+        committed,
+        ambiguous,
+    };
+
     /// A parsed tool-call-shaped string is not a dispatch until its outer tool
     /// resolves in the catalog. This deliberately uses the same trim and
     /// case-insensitive name rules as executeTool. A registered call counts
-    /// even when argument parsing, policy, or the downstream tool later
-    /// refuses it: recovery must not duplicate a real terminal attempt. An
-    /// unknown bare inner command does not count, because nothing received it.
+    /// as a terminal attempt even when argument parsing, policy, or the
+    /// downstream tool later refuses it — the refusal is then tracked as a
+    /// typed state, never silently treated as done. An unknown bare inner
+    /// command does not count, because nothing received it.
     fn isRegisteredToolName(self: *const Agent, name: []const u8) bool {
         const trimmed_name = std.mem.trim(u8, name, " \t\r\n");
         for (self.tools) |tool| {
@@ -2241,11 +2263,15 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
-        // True once any tool call matching final_commit_marker was dispatched
-        // this turn. Until then, a no-tool-call reply is premature for lanes
-        // that configure the marker (their contract ends the turn with a
-        // terminal commit tool call, never prose).
-        var terminal_commit_dispatched = false;
+        // Typed terminal-commit acknowledgement for final_commit_marker lanes
+        // (see TerminalCommitState). Until a commit is accepted, a no-tool-call
+        // reply is premature for lanes that configure the marker (their
+        // contract ends the turn with a terminal commit tool call, never
+        // prose). Bounds: at most one corrective nudge per turn and at most
+        // two definitive refusals before the turn fails closed.
+        var terminal_commit_state: TerminalCommitState = .not_attempted;
+        var terminal_definitive_refusals: u32 = 0;
+        var terminal_corrective_nudges: u32 = 0;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         // Turn wall-clock budget (message_timeout_secs; 0 = unbounded). Two
@@ -2712,32 +2738,73 @@ pub const Agent = struct {
 
                 // Structural guardrail (final_commit_marker lanes): the lane's
                 // contract says a turn ends with a terminal commit TOOL CALL,
-                // never prose — so a non-empty reply with no tool call before
-                // any commit attempt is premature whatever its wording. This
-                // is deliberately not a phrase heuristic: the measured failure
-                // (EM-1309 canary, 2026-08-29) was "I'll extract the content
-                // from these invoice PDFs…" ending the turn because "extract"
-                // was not on the phrase list below.
+                // never prose — so what a no-tool-call reply means depends on
+                // the measured terminal state, never on its wording.
                 if (self.final_commit_marker) |marker| {
-                    if (!terminal_commit_dispatched and
-                        forced_follow_through_count < 2 and
-                        iteration + 1 < self.max_tool_iterations)
-                    {
-                        try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
-                        const nudge = try std.fmt.allocPrint(
-                            self.allocator,
-                            "SYSTEM: You ended your reply without any tool call, but this turn has not yet committed. " ++
-                                "{s} is the required inner command, not a directly callable tool. Prose alone does not " ++
-                                "complete the turn and is never delivered. Use the model-callable transport and exact " ++
-                                "envelope from your system instructions to dispatch {s} now with what you already have. " ++
-                                "Never end with an announcement of what you will do.",
-                            .{ marker, marker },
-                        );
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
-                        self.trimHistory();
-                        self.freeResponseFields(&response);
-                        forced_follow_through_count += 1;
-                        continue;
+                    switch (terminal_commit_state) {
+                        .not_attempted => {
+                            // Premature prose before any commit attempt. This
+                            // is deliberately not a phrase heuristic: the
+                            // measured failure (EM-1309 canary, 2026-08-29)
+                            // was "I'll extract the content from these invoice
+                            // PDFs…" ending the turn because "extract" was not
+                            // on the phrase list below.
+                            if (forced_follow_through_count < 2 and
+                                iteration + 1 < self.max_tool_iterations)
+                            {
+                                try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
+                                const nudge = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "SYSTEM: You ended your reply without any tool call, but this turn has not yet committed. " ++
+                                        "{s} is the required inner command, not a directly callable tool. Prose alone does not " ++
+                                        "complete the turn and is never delivered. Use the model-callable transport and exact " ++
+                                        "envelope from your system instructions to dispatch {s} now with what you already have. " ++
+                                        "Never end with an announcement of what you will do.",
+                                    .{ marker, marker },
+                                );
+                                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
+                                self.trimHistory();
+                                self.freeResponseFields(&response);
+                                forced_follow_through_count += 1;
+                                continue;
+                            }
+                        },
+                        .definitively_refused => {
+                            // The terminal commit was definitively refused and
+                            // the model prosed instead of correcting. One
+                            // bounded corrective nudge; prose again after it
+                            // ends the turn closed, never as a prose success.
+                            if (terminal_corrective_nudges < 1 and
+                                iteration + 1 < self.max_tool_iterations)
+                            {
+                                try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
+                                const nudge = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "SYSTEM: Your terminal {s} commit was REFUSED by the server — nothing was committed, " ++
+                                        "and prose does not complete the turn. The refusal text you already received as the " ++
+                                        "tool result names exactly what to fix. Correct the arguments and re-dispatch {s} " ++
+                                        "now via the same transport and envelope from your system instructions.",
+                                    .{ marker, marker },
+                                );
+                                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
+                                self.trimHistory();
+                                self.freeResponseFields(&response);
+                                terminal_corrective_nudges += 1;
+                                continue;
+                            }
+                            self.freeResponseFields(&response);
+                            return error.TerminalCommitRefused;
+                        },
+                        .committed => {
+                            // Prose after an accepted commit is the normal
+                            // successful end of turn.
+                        },
+                        .ambiguous => {
+                            // Defensive only: ambiguity fails the turn closed
+                            // at the batch boundary, before another completion.
+                            self.freeResponseFields(&response);
+                            return error.TerminalCommitAmbiguous;
+                        },
                     }
                 }
 
@@ -2898,13 +2965,26 @@ pub const Agent = struct {
                     return self.interruptedReply();
                 }
 
-                if (self.final_commit_marker) |marker| {
-                    if (!terminal_commit_dispatched and
-                        self.isRegisteredToolName(call.name) and
-                        toolCallMatchesCommitMarker(marker, call.name, call.arguments_json))
-                    {
-                        terminal_commit_dispatched = true;
-                    }
+                // A terminal attempt is only a marker match on a REGISTERED
+                // outer tool (same trim/case rules as execution); the state
+                // transition itself is decided after the result is known.
+                const matches_terminal_marker = if (self.final_commit_marker) |marker|
+                    self.isRegisteredToolName(call.name) and
+                        toolCallMatchesCommitMarker(marker, call.name, call.arguments_json)
+                else
+                    false;
+
+                if (matches_terminal_marker and terminal_commit_state == .ambiguous) {
+                    // A prior terminal attempt may have landed server-side;
+                    // re-dispatching could duplicate it. Block without
+                    // executing; the turn fails closed after this batch.
+                    results_buf.appendAssumeCapacity(.{
+                        .name = call.name,
+                        .output = "Terminal commit outcome is ambiguous; re-dispatch blocked",
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    });
+                    continue;
                 }
 
                 if (self.log_tool_calls) {
@@ -2928,6 +3008,7 @@ pub const Agent = struct {
                             .output = cached_result.output,
                             .success = cached_result.success,
                             .tool_call_id = call.tool_call_id,
+                            .outcome = cached_result.outcome,
                         };
                     }
                     const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
@@ -2972,6 +3053,25 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
+                // Terminal-commit transition, decided AFTER execution from the
+                // typed outcome. Committed is sticky: a duplicate attempt's
+                // later refusal never regresses it.
+                if (matches_terminal_marker and terminal_commit_state != .committed) {
+                    if (result.success) {
+                        terminal_commit_state = .committed;
+                    } else switch (result.outcome) {
+                        .transport_failed => terminal_commit_state = .ambiguous,
+                        // .refused: the server executed and refused — no commit
+                        // happened. .ok with success=false is a purely local
+                        // failure (arguments, policy); nothing reached the
+                        // server, so it is equally definitive.
+                        .refused, .ok => {
+                            terminal_definitive_refusals += 1;
+                            terminal_commit_state = .definitively_refused;
+                        },
+                    }
+                }
+
                 try results_buf.append(self.allocator, result);
             }
 
@@ -2993,8 +3093,32 @@ pub const Agent = struct {
 
             self.trimHistory();
 
+            // Terminal-commit gates, applied at the batch boundary so no
+            // further completion can act on an unacceptable terminal state:
+            //  - ambiguous means the commit may have landed server-side; the
+            //    only safe move is to fail closed with no replay and no nudge;
+            //  - a second definitive refusal exhausts the bounded corrective
+            //    attempt; iterating further would burn budget on a turn that
+            //    can no longer end acceptably.
+            if (terminal_commit_state == .ambiguous) {
+                self.freeResponseFields(&response);
+                return error.TerminalCommitAmbiguous;
+            }
+            if (terminal_definitive_refusals >= 2) {
+                self.freeResponseFields(&response);
+                return error.TerminalCommitRefused;
+            }
+
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
+        }
+
+        // A definitively refused terminal commit must never end as a prose
+        // success — the summary below is exactly that shape (Gate B: turn
+        // "succeeds", nothing was committed). Fail closed instead.
+        // Not-attempted exhaustion keeps its existing summary behavior.
+        if (self.final_commit_marker != null and terminal_commit_state == .definitively_refused) {
+            return error.TerminalCommitRefused;
         }
 
         // ── Graceful degradation: tool iterations exhausted ──────────
@@ -3183,6 +3307,7 @@ pub const Agent = struct {
     const CachedToolCallResult = struct {
         success: bool,
         output: []const u8,
+        outcome: tools_mod.ToolOutcome = .ok,
     };
 
     fn deinitSeenToolCallResults(
@@ -3228,6 +3353,7 @@ pub const Agent = struct {
         seen_tool_call_results.put(allocator, fingerprint, .{
             .success = result.success,
             .output = output_copy,
+            .outcome = result.outcome,
         }) catch {
             if (output_copy.len > 0) allocator.free(output_copy);
         };
@@ -3391,6 +3517,7 @@ pub const Agent = struct {
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
                     .success = result.success,
                     .tool_call_id = call.tool_call_id,
+                    .outcome = result.outcome,
                 };
             }
         }
@@ -9930,6 +10057,406 @@ test "Agent toolCallMatchesCommitMarker matches name and arguments" {
     ));
     // Empty marker never matches (guard against a misconfigured empty string).
     try std.testing.expect(!Agent.toolCallMatchesCommitMarker("", "email_compose_reply", "{}"));
+}
+
+// ── Terminal-commit acknowledgement harness ─────────────────────────
+// Hermetic fixtures for the typed terminal state machine: a scripted native-
+// tools provider replays a fixed sequence of completions, and a scripted
+// terminal tool replays a fixed sequence of typed ToolResults. No network,
+// no subprocess, no real MCP server.
+const TerminalCommitLaneHarness = struct {
+    const ScriptedCall = struct {
+        id: []const u8,
+        name: []const u8 = "term_commit",
+        arguments: []const u8,
+    };
+
+    const Step = union(enum) {
+        calls: []const ScriptedCall,
+        prose: []const u8,
+    };
+
+    const ScriptedProvider = struct {
+        const Self = @This();
+        steps: []const Step,
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const step = self.steps[@min(self.call_count, self.steps.len - 1)];
+            self.call_count += 1;
+            switch (step) {
+                .calls => |calls| {
+                    const tool_calls = try allocator.alloc(providers.ToolCall, calls.len);
+                    for (calls, 0..) |c, i| {
+                        tool_calls[i] = .{
+                            .id = try allocator.dupe(u8, c.id),
+                            .name = try allocator.dupe(u8, c.name),
+                            .arguments = try allocator.dupe(u8, c.arguments),
+                        };
+                    }
+                    return .{
+                        .content = try allocator.dupe(u8, ""),
+                        .tool_calls = tool_calls,
+                        .usage = .{},
+                        .model = try allocator.dupe(u8, "test-model"),
+                    };
+                },
+                .prose => |text| return .{
+                    .content = try allocator.dupe(u8, text),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                },
+            }
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "scripted-terminal-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+
+        const vtable = Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .getName = getName,
+            .deinit = deinitFn,
+        };
+
+        fn provider(self: *Self) Provider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+    };
+
+    /// Replays a fixed sequence of typed ToolResults (static literals only, so
+    /// nothing needs freeing). Repeats the last entry when exhausted.
+    const ScriptedTerminalTool = struct {
+        const Self = @This();
+        results: []const tools_mod.ToolResult,
+        calls: usize = 0,
+        pub const tool_name = "term_commit";
+        pub const tool_description = "scripted terminal commit";
+        pub const tool_params = "{\"type\":\"object\"}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            const idx = @min(self.calls, self.results.len - 1);
+            self.calls += 1;
+            return self.results[idx];
+        }
+    };
+
+    /// A non-terminal work tool that always succeeds.
+    const ScriptedProbeTool = struct {
+        const Self = @This();
+        calls: usize = 0,
+        pub const tool_name = "probe";
+        pub const tool_description = "scripted probe";
+        pub const tool_params = "{\"type\":\"object\"}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.calls += 1;
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const REFUSED_RESULT = tools_mod.ToolResult{
+        .success = false,
+        .output = "REFUSED: askDispositions must account for every declared ask",
+        .outcome = .refused,
+    };
+    const COMMITTED_RESULT = tools_mod.ToolResult{
+        .success = true,
+        .output = "committed: proposal staged",
+    };
+    const TRANSPORT_FAILED_RESULT = tools_mod.ToolResult{
+        .success = false,
+        .output = "",
+        .error_msg = "MCP tool 'term_commit' failed: error.HttpRequestFailed",
+        .outcome = .transport_failed,
+    };
+
+    // Sentinels unique to each nudge variant.
+    const PREMATURE_NUDGE_SENTINEL = "ended your reply without any tool call";
+    const CORRECTIVE_NUDGE_SENTINEL = "was REFUSED by the server";
+
+    fn countHistoryContaining(agent: *const Agent, needle: []const u8) usize {
+        var n: usize = 0;
+        for (agent.history.items) |msg| {
+            if (std.mem.indexOf(u8, msg.content, needle) != null) n += 1;
+        }
+        return n;
+    }
+
+    fn makeAgent(allocator: std.mem.Allocator, provider: Provider, tool_list: []const Tool, observer: observability.Observer) !Agent {
+        return Agent{
+            .allocator = allocator,
+            .provider = provider,
+            .tools = tool_list,
+            .tool_specs = try allocator.alloc(ToolSpec, 0),
+            .mem = null,
+            .observer = observer,
+            .model_name = "test-model",
+            .temperature = 0.7,
+            .workspace_dir = "/tmp",
+            .max_tool_iterations = 6,
+            .max_history_messages = 50,
+            .auto_save = false,
+            .history = .empty,
+            .total_tokens = 0,
+            .has_system_prompt = false,
+            .final_commit_marker = "term_commit",
+        };
+    }
+};
+
+test "Agent terminal commit refused then corrected commits and ends clean" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .arguments = "{\"attempt\":2}" }} },
+        .{ .prose = "committed done" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{ H.REFUSED_RESULT, H.COMMITTED_RESULT } };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("compose the reply");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("committed done", response);
+    try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    // The refusal text reached the model as a tool result.
+    try std.testing.expect(H.countHistoryContaining(&agent, "askDispositions must account") >= 1);
+    // The model corrected itself from the tool result alone — no nudges.
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+}
+
+test "Agent terminal commit refused twice fails closed with typed error" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .arguments = "{\"attempt\":2}" }} },
+        .{ .prose = "never reached" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.REFUSED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.TerminalCommitRefused, agent.turn("compose the reply"));
+    try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
+    // Failed closed at the second batch boundary — no third completion.
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent terminal commit stays committed through a later duplicate refusal" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .arguments = "{\"attempt\":2}" }} },
+        .{ .prose = "all done" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{ H.COMMITTED_RESULT, H.REFUSED_RESULT } };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("compose the reply");
+    defer allocator.free(response);
+
+    // The duplicate attempt's refusal never regresses the committed state:
+    // the turn still ends as a normal prose success with zero nudges.
+    try std.testing.expectEqualStrings("all done", response);
+    try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+}
+
+test "Agent terminal commit transport failure is ambiguous and fails closed without replay" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .prose = "never reached" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.TRANSPORT_FAILED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.TerminalCommitAmbiguous, agent.turn("compose the reply"));
+    // The commit may have landed server-side: exactly one dispatch, no nudge,
+    // no second completion that could re-attempt it.
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+}
+
+test "Agent terminal ambiguity blocks a same-batch duplicate terminal dispatch" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{
+            .{ .id = "c1", .arguments = "{\"attempt\":1}" },
+            .{ .id = "c2", .arguments = "{\"attempt\":2}" },
+        } },
+        .{ .prose = "never reached" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.TRANSPORT_FAILED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.TerminalCommitAmbiguous, agent.turn("compose the reply"));
+    // The second terminal call in the same batch is blocked, not executed.
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+}
+
+test "Agent premature prose before any terminal attempt still gets the existing nudge" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .prose = "I'm working on it." },
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .prose = "done after commit" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("compose the reply");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done after commit", response);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    // Exactly one premature-prose nudge, and no corrective nudge.
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+}
+
+test "Agent refused terminal commit then prose gets one corrective nudge then commits" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .prose = "The commit was refused, so here is a summary instead." },
+        .{ .calls = &.{.{ .id = "c2", .arguments = "{\"attempt\":2}" }} },
+        .{ .prose = "done" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{ H.REFUSED_RESULT, H.COMMITTED_RESULT } };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("compose the reply");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
+    // Exactly one corrective nudge, and the premature-prose nudge never fired.
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+}
+
+test "Agent refused terminal commit then prose twice fails closed with typed error" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .prose = "The commit was refused, so here is a summary instead." },
+        .{ .prose = "Still just a summary, no commit." },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.REFUSED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.TerminalCommitRefused, agent.turn("compose the reply"));
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    // The corrective nudge fired exactly once before the hard failure.
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
+}
+
+test "Agent refused terminal commit at iteration exhaustion fails closed instead of summarizing" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .arguments = "{\"attempt\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .name = "probe", .arguments = "{\"n\":1}" }} },
+        .{ .prose = "summary that must never be produced" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.REFUSED_RESULT} };
+    var probe_impl = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ tool_impl.tool(), probe_impl.tool() };
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.max_tool_iterations = 2;
+    defer agent.deinit();
+
+    // A refused terminal commit must never end as a prose success — the
+    // iteration-exhaustion summary is exactly that shape.
+    try std.testing.expectError(error.TerminalCommitRefused, agent.turn("compose the reply"));
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe_impl.calls);
+    // No summary completion was requested after exhaustion.
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
 test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
