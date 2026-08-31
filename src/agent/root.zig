@@ -2272,6 +2272,15 @@ pub const Agent = struct {
         var terminal_commit_state: TerminalCommitState = .not_attempted;
         var terminal_definitive_refusals: u32 = 0;
         var terminal_corrective_nudges: u32 = 0;
+        // Dedicated pre-commit prose-nudge budget (never shared with the
+        // promise guardrail's forced_follow_through_count, which must not be
+        // able to starve it), and the one-shot terminal reserve: one extra
+        // completion, spendable only to reach the terminal commit when the
+        // iteration bound would otherwise end a not-attempted turn (the EM-85
+        // Gate B' run-7 shape: heavy work, budget exhausted, prose out,
+        // nothing committed, exit 0).
+        var terminal_premature_prose_nudges: u32 = 0;
+        var terminal_reserve_followups: u32 = 0;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         // Turn wall-clock budget (message_timeout_secs; 0 = unbounded). Two
@@ -2287,7 +2296,7 @@ pub const Agent = struct {
         const turn_wall_started_ms: i64 = std_compat.time.milliTimestamp();
         const turn_budget_ms: u64 = self.message_timeout_secs *| 1000;
         var wrap_up_notice_injected = false;
-        while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
+        while (iteration < self.max_tool_iterations +| injection_followups +| terminal_reserve_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
             }
@@ -2749,9 +2758,22 @@ pub const Agent = struct {
                             // was "I'll extract the content from these invoice
                             // PDFs…" ending the turn because "extract" was not
                             // on the phrase list below.
-                            if (forced_follow_through_count < 2 and
-                                iteration + 1 < self.max_tool_iterations)
+                            //
+                            // The nudge budget is DEDICATED (the promise
+                            // guardrail below cannot starve it), and when the
+                            // loop bound would block the nudge the one-shot
+                            // terminal reserve extends the loop by exactly one
+                            // completion. When both are spent the turn fails
+                            // CLOSED — a marker-lane turn may only end
+                            // committed or fail closed, never as an exit-0
+                            // prose success with nothing committed (EM-85
+                            // Gate B' run 7, 2026-08-31).
+                            const loop_bound = self.max_tool_iterations +| injection_followups +| terminal_reserve_followups;
+                            const within_bound = iteration + 1 < loop_bound;
+                            if (terminal_premature_prose_nudges < 2 and
+                                (within_bound or terminal_reserve_followups == 0))
                             {
+                                if (!within_bound) terminal_reserve_followups += 1;
                                 try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
                                 const nudge = try std.fmt.allocPrint(
                                     self.allocator,
@@ -2765,9 +2787,11 @@ pub const Agent = struct {
                                 try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
                                 self.trimHistory();
                                 self.freeResponseFields(&response);
-                                forced_follow_through_count += 1;
+                                terminal_premature_prose_nudges += 1;
                                 continue;
                             }
+                            self.freeResponseFields(&response);
+                            return error.TerminalCommitNotAttempted;
                         },
                         .definitively_refused => {
                             // The terminal commit was definitively refused and
@@ -2775,7 +2799,7 @@ pub const Agent = struct {
                             // bounded corrective nudge; prose again after it
                             // ends the turn closed, never as a prose success.
                             if (terminal_corrective_nudges < 1 and
-                                iteration + 1 < self.max_tool_iterations)
+                                iteration + 1 < self.max_tool_iterations +| injection_followups +| terminal_reserve_followups)
                             {
                                 try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
                                 const nudge = try std.fmt.allocPrint(
@@ -3109,16 +3133,49 @@ pub const Agent = struct {
                 return error.TerminalCommitRefused;
             }
 
+            // One-shot terminal reserve (final_commit_marker lanes): the model
+            // is still doing work on the last permitted iteration and has never
+            // attempted its terminal commit. Spend one reserved completion that
+            // may only be used to commit — the alternative is the summary path
+            // after the loop, which ends a heavy turn as an exit-0 prose
+            // success with nothing committed (EM-85 Gate B' run 7, 2026-08-31:
+            // 11 declared children, zero commit dispatches, 1.4 KB of prose).
+            if (self.final_commit_marker) |marker_name| {
+                if (terminal_commit_state == .not_attempted and
+                    terminal_reserve_followups == 0 and
+                    iteration + 1 >= self.max_tool_iterations +| injection_followups)
+                {
+                    terminal_reserve_followups += 1;
+                    const reserve_nudge = try std.fmt.allocPrint(
+                        self.allocator,
+                        "SYSTEM: Tool iterations are exhausted and this turn has not yet committed. " ++
+                            "The ONLY permitted action is to dispatch {s} now, via the model-callable " ++
+                            "transport and exact envelope from your system instructions, with what you " ++
+                            "already have. Make no other tool calls; prose alone is never delivered.",
+                        .{marker_name},
+                    );
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = reserve_nudge });
+                    self.trimHistory();
+                }
+            }
+
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
         }
 
-        // A definitively refused terminal commit must never end as a prose
-        // success — the summary below is exactly that shape (Gate B: turn
-        // "succeeds", nothing was committed). Fail closed instead.
-        // Not-attempted exhaustion keeps its existing summary behavior.
-        if (self.final_commit_marker != null and terminal_commit_state == .definitively_refused) {
-            return error.TerminalCommitRefused;
+        // A final_commit_marker turn may only end committed or fail closed —
+        // the summary below is a prose success, exactly the shape Gate B
+        // (refused-then-summary) and Gate B' run 7 (never-attempted-then-
+        // summary) measured: the turn "succeeds", nothing was committed. The
+        // reserve above has already offered a not-attempted turn its one
+        // dedicated commit completion by this point.
+        if (self.final_commit_marker != null) {
+            switch (terminal_commit_state) {
+                .definitively_refused => return error.TerminalCommitRefused,
+                .not_attempted => return error.TerminalCommitNotAttempted,
+                .ambiguous => return error.TerminalCommitAmbiguous,
+                .committed => {},
+            }
         }
 
         // ── Graceful degradation: tool iterations exhausted ──────────
@@ -10198,6 +10255,7 @@ const TerminalCommitLaneHarness = struct {
     // Sentinels unique to each nudge variant.
     const PREMATURE_NUDGE_SENTINEL = "ended your reply without any tool call";
     const CORRECTIVE_NUDGE_SENTINEL = "was REFUSED by the server";
+    const EXHAUSTION_NUDGE_SENTINEL = "Tool iterations are exhausted";
 
     fn countHistoryContaining(agent: *const Agent, needle: []const u8) usize {
         var n: usize = 0;
@@ -10457,6 +10515,120 @@ test "Agent refused terminal commit at iteration exhaustion fails closed instead
     try std.testing.expectEqual(@as(usize, 1), probe_impl.calls);
     // No summary completion was requested after exhaustion.
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent prose surrender before any terminal attempt fails closed after bounded nudges" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .prose = "I'm preparing the reply." },
+        .{ .prose = "Here is what I would send." },
+        .{ .prose = "Summary of the work instead of a commit." },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+
+    // A final_commit_marker turn may only end committed or fail closed —
+    // never as an exit-0 prose success with nothing committed (the EM-85
+    // Gate B' run-7 shape: heavy work, zero commit dispatches, prose out).
+    try std.testing.expectError(error.TerminalCommitNotAttempted, agent.turn("compose the reply"));
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    // Both dedicated premature-prose nudges fired before the hard failure.
+    try std.testing.expectEqual(@as(usize, 2), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
+}
+
+test "Agent not-attempted iteration exhaustion spends one reserved terminal completion and commits" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .name = "probe", .arguments = "{\"n\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .name = "probe", .arguments = "{\"n\":2}" }} },
+        .{ .calls = &.{.{ .id = "c3", .arguments = "{\"attempt\":1}" }} },
+        .{ .prose = "committed done" },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    var probe_impl = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ tool_impl.tool(), probe_impl.tool() };
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.max_tool_iterations = 2;
+    defer agent.deinit();
+
+    const response = try agent.turn("compose the reply");
+    defer allocator.free(response);
+
+    // The model was still doing work when the budget ran out; the one-shot
+    // reserved completion carries the commit and the turn ends committed.
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 2), probe_impl.calls);
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.EXHAUSTION_NUDGE_SENTINEL));
+    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, response, "committed done") != null);
+}
+
+test "Agent not-attempted exhaustion whose reserved completion proses fails closed" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .name = "probe", .arguments = "{\"n\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .name = "probe", .arguments = "{\"n\":2}" }} },
+        .{ .prose = "I did a great deal of work but will not commit." },
+    } };
+    var tool_impl = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    var probe_impl = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ tool_impl.tool(), probe_impl.tool() };
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.max_tool_iterations = 2;
+    defer agent.deinit();
+
+    // The reserve is one-shot: prose on the reserved completion fails closed,
+    // it does not buy a second extension or fall through to a prose success.
+    try std.testing.expectError(error.TerminalCommitNotAttempted, agent.turn("compose the reply"));
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.calls);
+    try std.testing.expectEqual(@as(usize, 2), probe_impl.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.EXHAUSTION_NUDGE_SENTINEL));
+}
+
+test "Agent without commit marker keeps summary behavior at iteration exhaustion" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .name = "probe", .arguments = "{\"n\":1}" }} },
+        .{ .calls = &.{.{ .id = "c2", .name = "probe", .arguments = "{\"n\":2}" }} },
+        .{ .prose = "summary text" },
+    } };
+    var probe_impl = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{probe_impl.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.final_commit_marker = null;
+    agent.max_tool_iterations = 2;
+    defer agent.deinit();
+
+    const response = try agent.turn("summarize");
+    defer allocator.free(response);
+
+    // Non-marker lanes keep graceful degradation: exhaustion still yields the
+    // prefixed summary, with no reserve and no typed failure.
+    try std.testing.expect(std.mem.indexOf(u8, response, "summary text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "[Tool iteration limit: 2/2]") != null);
+    try std.testing.expectEqual(@as(usize, 2), probe_impl.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.EXHAUSTION_NUDGE_SENTINEL));
 }
 
 test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
