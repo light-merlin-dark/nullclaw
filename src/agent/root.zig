@@ -995,12 +995,25 @@ pub const Agent = struct {
     /// marker. Matched against BOTH the tool name and the raw arguments JSON,
     /// because a lane that funnels every command through one tool (e.g. an
     /// `invoke {command: ...}` CLI surface) carries the commit's name only in
-    /// the arguments. An attempted commit counts even if the tool result was a
-    /// refusal — nudging a model that already tried the commit adds nothing.
+    /// the arguments.
     fn toolCallMatchesCommitMarker(marker: []const u8, name: []const u8, arguments_json: []const u8) bool {
         if (marker.len == 0) return false;
         return std.mem.indexOf(u8, name, marker) != null or
             std.mem.indexOf(u8, arguments_json, marker) != null;
+    }
+
+    /// A parsed tool-call-shaped string is not a dispatch until its outer tool
+    /// resolves in the catalog. This deliberately uses the same trim and
+    /// case-insensitive name rules as executeTool. A registered call counts
+    /// even when argument parsing, policy, or the downstream tool later
+    /// refuses it: recovery must not duplicate a real terminal attempt. An
+    /// unknown bare inner command does not count, because nothing received it.
+    fn isRegisteredToolName(self: *const Agent, name: []const u8) bool {
+        const trimmed_name = std.mem.trim(u8, name, " \t\r\n");
+        for (self.tools) |tool| {
+            if (std.ascii.eqlIgnoreCase(tool.name(), trimmed_name)) return true;
+        }
+        return false;
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -2713,7 +2726,11 @@ pub const Agent = struct {
                         try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
                         const nudge = try std.fmt.allocPrint(
                             self.allocator,
-                            "SYSTEM: You ended your reply without any tool call, but this turn has not yet committed its reply through {s}. Prose alone does not complete the turn and is never delivered. Either issue the next tool call now, or call {s} now with what you already have. Never end with an announcement of what you will do.",
+                            "SYSTEM: You ended your reply without any tool call, but this turn has not yet committed. " ++
+                                "{s} is the required inner command, not a directly callable tool. Prose alone does not " ++
+                                "complete the turn and is never delivered. Use the model-callable transport and exact " ++
+                                "envelope from your system instructions to dispatch {s} now with what you already have. " ++
+                                "Never end with an announcement of what you will do.",
                             .{ marker, marker },
                         );
                         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = nudge });
@@ -2883,6 +2900,7 @@ pub const Agent = struct {
 
                 if (self.final_commit_marker) |marker| {
                     if (!terminal_commit_dispatched and
+                        self.isRegisteredToolName(call.name) and
                         toolCallMatchesCommitMarker(marker, call.name, call.arguments_json))
                     {
                         terminal_commit_dispatched = true;
