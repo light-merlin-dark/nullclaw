@@ -782,6 +782,18 @@ test "parseCallToolResponse error" {
     try std.testing.expectError(error.JsonRpcError, parseCallToolResponse(std.testing.allocator, resp));
 }
 
+test "parseCallToolOutcome treats unknown tool effect as JSON-RPC transport failure" {
+    // Regression: a server may commit the remote effect and then fail to
+    // persist its receipt. That is a top-level JSON-RPC error, not an MCP
+    // CallToolResult refusal: McpToolWrapper maps this parser error to
+    // ToolOutcome.transport_failed, and terminal commits therefore fail
+    // ambiguous without entering the correctable-refusal replay path.
+    const resp =
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Tool execution outcome is unknown; do not retry automatically","data":{"code":"MCP_TOOL_OUTCOME_UNKNOWN","outcome":"unknown","retryable":false}}}
+    ;
+    try std.testing.expectError(error.JsonRpcError, parseCallToolOutcome(std.testing.allocator, resp));
+}
+
 test "parseCallToolResponse invalid json" {
     try std.testing.expectError(error.InvalidJson, parseCallToolResponse(std.testing.allocator, "not json"));
 }
