@@ -2364,9 +2364,50 @@ pub const Agent = struct {
                         };
                     }
 
-                    if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
-                    self.emitUsageFailure(turn_model_name);
-                    return err;
+                    if (self.routeShouldBeDegraded(err)) {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                        self.emitUsageFailure(turn_model_name);
+                        return err;
+                    }
+
+                    // Retry once — mirror of the blocking path's transient
+                    // retry below. Until this existed the streaming branch
+                    // propagated a transient provider error straight out of
+                    // the turn, so an agent whose provider forces buffered
+                    // dispatch (max_streaming_prompt_bytes: 0) got the
+                    // streaming path's error handling with the blocking
+                    // path's wire behavior — one transient failure discarded
+                    // a whole turn. Rate-limit/quota errors are excluded
+                    // above, exactly as in the blocking branch; the
+                    // wholesale re-stream follows the vision-disable retry's
+                    // own precedent in this catch.
+                    log.warn("provider stream call failed ({s}); retrying once", .{@errorName(err)});
+                    std_compat.thread.sleep(500 * std.time.ns_per_ms);
+                    response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, messages);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, true);
+                    break :retry_stream self.provider.streamChat(
+                        self.allocator,
+                        .{
+                            .messages = messages,
+                            .session_id = self.memory_session_id,
+                            .model = turn_model_name,
+                            .temperature = self.temperature,
+                            .max_tokens = request_max_tokens,
+                            .tools = null,
+                            .timeout_secs = per_call_timeout_secs,
+                            .reasoning_effort = self.reasoning_effort,
+                            .include_reasoning = include_reasoning,
+                        },
+                        turn_model_name,
+                        self.temperature,
+                        self.stream_callback.?,
+                        self.stream_ctx.?,
+                    ) catch |retry_err| {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                        self.emitUsageFailure(turn_model_name);
+                        return retry_err;
+                    };
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
