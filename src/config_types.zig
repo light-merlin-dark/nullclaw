@@ -432,6 +432,9 @@ pub const AgentConfig = struct {
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
+    /// Structural runtime allowlist (Agent Central hardening norm N3).
+    /// Empty preserves the complete build-provided set for existing consumers.
+    tool_allowlist: []const []const u8 = &.{},
     /// List of models that do not support image/vision input.
     /// When image markers are detected and the model is in this list,
     /// the agent will skip processing images instead of returning an error.

@@ -160,6 +160,8 @@ pub const ChatMessage = struct {
     name: ?[]const u8 = null,
     /// Tool call ID this message responds to.
     tool_call_id: ?[]const u8 = null,
+    /// Serialized OpenAI tool-call array, carried only by native-history providers.
+    tool_calls_json: ?[]const u8 = null,
     /// Optional multimodal content parts (images, etc.). When set, providers
     /// serialize these instead of the plain `content` field.
     content_parts: ?[]const ContentPart = null,
@@ -396,6 +398,7 @@ pub const Provider = struct {
 
         /// Whether this provider supports native tool calls.
         supportsNativeTools: *const fn (ptr: *anyopaque) bool,
+        supportsNativeToolHistory: ?*const fn (ptr: *anyopaque) bool = null,
 
         /// Provider name for diagnostics.
         getName: *const fn (ptr: *anyopaque) []const u8,
@@ -449,6 +452,11 @@ pub const Provider = struct {
 
     pub fn supportsNativeTools(self: Provider) bool {
         return self.vtable.supportsNativeTools(self.ptr);
+    }
+
+    pub fn supportsNativeToolHistory(self: Provider) bool {
+        if (self.vtable.supportsNativeToolHistory) |supports| return supports(self.ptr);
+        return false;
     }
 
     pub fn getName(self: Provider) []const u8 {

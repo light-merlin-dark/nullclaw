@@ -1138,6 +1138,7 @@ pub const OpenAiCompatibleProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supportsNativeToolHistory = supportsNativeToolHistoryImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
@@ -1518,6 +1519,11 @@ pub const OpenAiCompatibleProvider = struct {
         };
     }
 
+    fn supportsNativeToolHistoryImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.api_mode != .responses;
+    }
+
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return self.native_tools;
@@ -1566,6 +1572,10 @@ fn serializeMessagesInto(
             try buf.appendSlice(allocator, msg.role.toSlice());
             try buf.appendSlice(allocator, "\",\"content\":");
             try serializeMessageContent(buf, allocator, msg);
+            if (msg.tool_calls_json) |calls| {
+                try buf.appendSlice(allocator, ",\"tool_calls\":");
+                try buf.appendSlice(allocator, calls);
+            }
             if (msg.tool_call_id) |tc_id| {
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
@@ -1621,6 +1631,10 @@ fn serializeMessagesInto(
             try serializeMessageContent(buf, allocator, msg);
         }
 
+        if (msg.tool_calls_json) |calls| {
+            try buf.appendSlice(allocator, ",\"tool_calls\":");
+            try buf.appendSlice(allocator, calls);
+        }
         if (msg.tool_call_id) |tc_id| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(buf, allocator, tc_id);
@@ -3324,4 +3338,29 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
     // Individual messages are each under the limit; verify the sum is what matters.
     const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}
+
+test "native assistant and tool result envelopes survive both system-role modes" {
+    const calls = "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"invoke\",\"arguments\":\"{}\"}}]";
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "system" },
+        .{ .role = .user, .content = "ask" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = calls },
+        .{ .role = .tool, .content = "accepted", .tool_call_id = "call_1" },
+    };
+    for ([_]bool{ false, true }) |merge_system| {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try buf.append(std.testing.allocator, '[');
+        try serializeMessagesInto(&buf, std.testing.allocator, &messages, merge_system);
+        try buf.append(std.testing.allocator, ']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buf.items, .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        const assistant = items[items.len - 2].object;
+        const result = items[items.len - 1].object;
+        try std.testing.expectEqualStrings("call_1", assistant.get("tool_calls").?.array.items[0].object.get("id").?.string);
+        try std.testing.expectEqualStrings("tool", result.get("role").?.string);
+        try std.testing.expectEqualStrings("call_1", result.get("tool_call_id").?.string);
+    }
 }

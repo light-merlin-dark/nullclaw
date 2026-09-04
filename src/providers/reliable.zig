@@ -366,6 +366,7 @@ pub const ReliableProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supportsNativeToolHistory = supportsNativeToolHistoryImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
@@ -642,6 +643,15 @@ pub const ReliableProvider = struct {
             }
         }
         return error.ProviderDoesNotSupportVision;
+    }
+
+    fn supportsNativeToolHistoryImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        if (!self.inner.supportsNativeToolHistory()) return false;
+        for (self.extras) |entry| {
+            if (!entry.provider.supportsNativeToolHistory()) return false;
+        }
+        return true;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {

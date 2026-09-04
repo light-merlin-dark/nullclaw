@@ -382,6 +382,7 @@ pub fn allTools(
         backend_name: []const u8 = "hybrid",
         sandbox_backend: ConfigSandboxBackend = .auto,
         sandbox_enabled: bool = true,
+        tool_allowlist: []const []const u8 = &.{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .empty;
@@ -621,6 +622,28 @@ pub fn allTools(
     }
 
     applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
+
+    // Port of Agent Central's pinned structural-tool-allowlist patch. Filter
+    // the actual registry after custom names resolve, not just advertised specs.
+    if (opts.tool_allowlist.len > 0) {
+        var index: usize = 0;
+        while (index < list.items.len) {
+            const candidate = list.items[index];
+            var allowed = false;
+            for (opts.tool_allowlist) |allowed_name| {
+                if (std.mem.eql(u8, candidate.name(), allowed_name)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (allowed) {
+                index += 1;
+            } else {
+                const removed = list.orderedRemove(index);
+                removed.deinit(allocator);
+            }
+        }
+    }
 
     return list.toOwnedSlice(allocator);
 }
@@ -1514,4 +1537,22 @@ test "all tools wires anonymize_text and end-to-end redacts an email" {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "structural allowlist removes undeclared runtime tools" {
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tool_allowlist = &.{ "file_read", "file_write" },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expectEqualStrings("file_read", tools[0].name());
+    try std.testing.expectEqualStrings("file_write", tools[1].name());
+}
+
+test "unknown structural allowlist grants no tools" {
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tool_allowlist = &.{"no_such_declared_tool"},
+    });
+    defer deinitTools(std.testing.allocator, tools);
+    try std.testing.expectEqual(@as(usize, 0), tools.len);
 }

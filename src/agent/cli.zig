@@ -657,6 +657,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .backend_name = cfg.memory.backend,
         .sandbox_backend = cfg.security.sandbox.backend,
         .sandbox_enabled = cfg.sandboxEnabled(),
+        .tool_allowlist = cfg.agent.tool_allowlist,
     });
     defer tools_mod.deinitTools(allocator, tools);
 

@@ -1362,6 +1362,7 @@ pub const Config = struct {
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
             .timezone = self.agent.timezone,
+            .tool_allowlist = self.agent.tool_allowlist,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
             .enable_pii_redaction = self.agent.enable_pii_redaction,
@@ -4111,7 +4112,7 @@ test "json parse agent section" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "timezone": "UTC+08:00", "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "timezone": "UTC+08:00", "tool_allowlist": ["file_read", "file_write"], "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -4124,6 +4125,8 @@ test "json parse agent section" {
     try std.testing.expect(cfg.agent.token_limit_explicit);
     try std.testing.expect(!cfg.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", cfg.agent.timezone);
+    try std.testing.expectEqual(@as(usize, 2), cfg.agent.tool_allowlist.len);
+    try std.testing.expectEqualStrings("file_read", cfg.agent.tool_allowlist[0]);
     try std.testing.expectEqual(@as(usize, 1), cfg.agent.vision_disabled_models.len);
     try std.testing.expectEqualStrings("router/text-only", cfg.agent.vision_disabled_models[0]);
     try std.testing.expect(!cfg.agent.auto_disable_vision_on_error);

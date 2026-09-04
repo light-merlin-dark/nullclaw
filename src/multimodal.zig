@@ -388,6 +388,7 @@ pub fn prepareMessagesForProvider(
             .content = if (parsed.cleaned_text.len > 0) parsed.cleaned_text else msg.content,
             .name = msg.name,
             .tool_call_id = msg.tool_call_id,
+            .tool_calls_json = msg.tool_calls_json,
             .content_parts = try parts.toOwnedSlice(arena),
         };
     }
@@ -456,6 +457,7 @@ pub fn stripImageMarkers(arena: std.mem.Allocator, messages: []const ChatMessage
             .content = final_content,
             .name = msg.name,
             .tool_call_id = msg.tool_call_id,
+            .tool_calls_json = msg.tool_calls_json,
             .content_parts = null,
         };
     }

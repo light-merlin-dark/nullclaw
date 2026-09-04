@@ -1801,6 +1801,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse
                     return error.InvalidDefaultQueueMode;
             }
+            if (ag.object.get("tool_allowlist")) |v| {
+                if (v != .array) return error.InvalidToolAllowlist;
+                for (v.array.items) |name| {
+                    if (name != .string or name.string.len == 0) return error.InvalidToolAllowlist;
+                }
+                self.agent.tool_allowlist = try parseStringArray(self.allocator, v.array);
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {

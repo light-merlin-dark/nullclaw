@@ -1360,6 +1360,7 @@ pub const ChannelRuntime = struct {
             .backend_name = config.memory.backend,
             .sandbox_backend = config.security.sandbox.backend,
             .sandbox_enabled = config.sandboxEnabled(),
+            .tool_allowlist = config.agent.tool_allowlist,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 

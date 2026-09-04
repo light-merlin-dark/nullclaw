@@ -2825,6 +2825,7 @@ fn initLocalAgentRuntime(
         .backend_name = cfg.memory.backend,
         .sandbox_backend = cfg.security.sandbox.backend,
         .sandbox_enabled = cfg.sandboxEnabled(),
+        .tool_allowlist = cfg.agent.tool_allowlist,
     }) catch &.{};
     errdefer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
 

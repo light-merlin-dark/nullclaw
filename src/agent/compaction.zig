@@ -71,6 +71,8 @@ pub fn tokenEstimate(history: []const OwnedMessage) u64 {
     var total_chars: u64 = 0;
     for (history) |*msg| {
         total_chars += msg.content.len;
+        if (msg.tool_calls_json) |calls| total_chars += calls.len;
+        if (msg.tool_call_id) |id| total_chars += id.len;
     }
     return (total_chars + 3) / 4;
 }
@@ -274,8 +276,14 @@ fn buildCompactionTranscript(
     errdefer buf.deinit(allocator);
 
     for (history_items[start..end]) |*msg| {
+        const native_content = if (msg.tool_calls_json) |calls|
+            try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ msg.content, calls })
+        else
+            null;
+        defer if (native_content) |content| allocator.free(content);
+        const complete_content = native_content orelse msg.content;
         const redacted_content = if (redactor) |r|
-            try r.redact(allocator, msg.content)
+            try r.redact(allocator, complete_content)
         else
             null;
         defer if (redacted_content) |content| allocator.free(content);
@@ -289,7 +297,7 @@ fn buildCompactionTranscript(
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
         // Redact before truncation so boundary cuts cannot leave partial PII.
-        const source_content = redacted_content orelse msg.content;
+        const source_content = redacted_content orelse complete_content;
         const content = if (source_content.len > 500) util.truncateUtf8(source_content, 500) else source_content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');

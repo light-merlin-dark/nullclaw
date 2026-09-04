@@ -3680,3 +3680,30 @@ test "buildAssistantHistoryWithToolCalls escapes special chars in name" {
     const name = parsed.value.object.get("name").?.string;
     try std.testing.expectEqualStrings("shell\"injection", name);
 }
+
+/// Preserve provider call IDs and argument strings on the native return leg.
+pub fn nativeToolCallsJson(allocator: std.mem.Allocator, calls: []const ParsedToolCall) ![]const u8 {
+    var values = try allocator.alloc(struct {
+        id: []const u8,
+        type: []const u8 = "function",
+        function: struct { name: []const u8, arguments: []const u8 },
+    }, calls.len);
+    defer allocator.free(values);
+    for (calls, 0..) |call, i| {
+        values[i] = .{ .id = call.tool_call_id orelse return error.NativeToolCallIdMissing, .function = .{ .name = call.name, .arguments = call.arguments_json } };
+    }
+    return std.json.Stringify.valueAlloc(allocator, values, .{});
+}
+
+test "native call history preserves identity and escaped argument strings" {
+    const calls = [_]ParsedToolCall{.{ .name = "invoke", .arguments_json = "{\"text\":\"hello\"}", .tool_call_id = "call_1" }};
+    const serialized = try nativeToolCallsJson(std.testing.allocator, &calls);
+    defer std.testing.allocator.free(serialized);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, serialized, .{});
+    defer parsed.deinit();
+    const call = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("call_1", call.get("id").?.string);
+    try std.testing.expectEqualStrings(calls[0].arguments_json, call.get("function").?.object.get("arguments").?.string);
+    const invalid = [_]ParsedToolCall{.{ .name = "invoke", .arguments_json = "{}" }};
+    try std.testing.expectError(error.NativeToolCallIdMissing, nativeToolCallsJson(std.testing.allocator, &invalid));
+}

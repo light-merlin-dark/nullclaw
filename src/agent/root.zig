@@ -467,15 +467,24 @@ pub const Agent = struct {
     pub const OwnedMessage = struct {
         role: providers.Role,
         content: []const u8,
+        tool_call_id: ?[]const u8 = null,
+        tool_calls_json: ?[]const u8 = null,
 
         pub fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
+            if (self.tool_call_id) |id| allocator.free(id);
+            if (self.tool_calls_json) |calls| allocator.free(calls);
         }
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
-            return .{ .role = self.role, .content = self.content };
+            return .{ .role = self.role, .content = self.content, .tool_call_id = self.tool_call_id, .tool_calls_json = self.tool_calls_json };
         }
     };
+
+    fn nativeToolCallsForHistory(self: *Agent, calls: []const ParsedToolCall) ![]const u8 {
+        const serialized = try dispatcher.nativeToolCallsJson(self.allocator, calls);
+        return self.redactOwnedForHistory(serialized);
+    }
 
     /// Append a history message that owns its content.
     /// On append failure, the message is deinitialized to avoid leaks.
@@ -821,6 +830,7 @@ pub const Agent = struct {
         for (messages) |msg| {
             if (msg.name) |name| total_chars +|= name.len;
             if (msg.tool_call_id) |tool_call_id| total_chars +|= tool_call_id.len;
+            if (msg.tool_calls_json) |calls| total_chars +|= calls.len;
             if (msg.content_parts) |parts| {
                 // content_parts are the provider-facing payload; avoid double counting
                 // mirrored plain `content` unless parts are unexpectedly empty.
@@ -2705,11 +2715,10 @@ pub const Agent = struct {
                 }
 
                 // Build history content with serialized tool calls
-                assistant_history_content = try dispatcher.buildAssistantHistoryWithToolCalls(
-                    self.allocator,
-                    response_text,
-                    parsed_calls,
-                );
+                assistant_history_content = if (self.provider.supportsNativeToolHistory())
+                    try self.allocator.dupe(u8, response_text)
+                else
+                    try dispatcher.buildAssistantHistoryWithToolCalls(self.allocator, response_text, parsed_calls);
                 free_assistant_history = true;
             } else {
                 // No native tool calls — parse response text for XML tool calls
@@ -2970,7 +2979,12 @@ pub const Agent = struct {
 
             // Once appended, history owns the buffer.
             const safe_assistant_content = try self.redactOwnedForHistory(assistant_content);
-            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
+            const native_history = use_native and self.provider.supportsNativeToolHistory();
+            const native_calls_json = if (native_history) self.nativeToolCallsForHistory(parsed_calls) catch |err| {
+                self.allocator.free(safe_assistant_content);
+                return err;
+            } else null;
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content, .tool_calls_json = native_calls_json });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -3109,21 +3123,35 @@ pub const Agent = struct {
                 try results_buf.append(self.allocator, result);
             }
 
-            // Format tool results, scrub credentials, add reflection prompt, and add to history
-            const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
-            const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
-            const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
-            const with_reflection = try std.fmt.allocPrint(
-                arena,
-                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
-                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
-                .{redacted_results},
-            );
-            try self.history.append(self.allocator, .{
-                .role = .user,
-                .content = try self.allocator.dupe(u8, with_reflection),
-            });
+            if (native_history) {
+                for (results_buf.items) |result| {
+                    const scrubbed = try providers.scrubToolOutput(arena, result.output);
+                    const redacted = if (self.redactor) |r| try r.redact(arena, scrubbed) else scrubbed;
+                    const id = result.tool_call_id orelse return error.NativeToolCallIdMissing;
+                    const owned_content = try self.allocator.dupe(u8, redacted);
+                    const owned_id = self.allocator.dupe(u8, id) catch |err| {
+                        self.allocator.free(owned_content);
+                        return err;
+                    };
+                    try self.appendOwnedHistoryMessage(.{ .role = .tool, .content = owned_content, .tool_call_id = owned_id });
+                }
+            } else {
+                // Format tool results, scrub credentials, add reflection prompt, and add to history
+                const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
+                const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+                const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
+                const with_reflection = try std.fmt.allocPrint(
+                    arena,
+                    "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                        "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                        "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                    .{redacted_results},
+                );
+                try self.history.append(self.allocator, .{
+                    .role = .user,
+                    .content = try self.allocator.dupe(u8, with_reflection),
+                });
+            }
 
             self.trimHistory();
 
@@ -4095,6 +4123,7 @@ pub const Agent = struct {
             if (msg.content.len > 0) {
                 out[i].content = try redactor.redact(arena, msg.content);
             }
+            if (msg.tool_calls_json) |calls| out[i].tool_calls_json = try redactor.redact(arena, calls);
             if (msg.content_parts) |parts| {
                 out[i].content_parts = try redactContentParts(arena, parts, redactor);
             }

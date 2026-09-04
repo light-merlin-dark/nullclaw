@@ -155,6 +155,7 @@ pub const RouterProvider = struct {
         .chat = chatImpl,
         .chat_with_tools = chatWithToolsImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supportsNativeToolHistory = supportsNativeToolHistoryImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
@@ -214,6 +215,15 @@ pub const RouterProvider = struct {
         resolved_request.model = resolved_model;
         const target = self.providers[provider_idx];
         return target.chatWithTools(allocator, resolved_request);
+    }
+
+    fn supportsNativeToolHistoryImpl(ptr: *anyopaque) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        if (self.providers.len == 0) return false;
+        for (self.providers) |candidate| {
+            if (!candidate.supportsNativeToolHistory()) return false;
+        }
+        return true;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
