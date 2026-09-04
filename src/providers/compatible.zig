@@ -1300,6 +1300,22 @@ pub const OpenAiCompatibleProvider = struct {
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        // A zero `max_streaming_prompt_bytes` means EVERY request skips
+        // streaming — `shouldSkipStreaming` compares `>= limit`, so zero is
+        // "always". Such a provider must not advertise streaming, because the
+        // agent loop gates NATIVE TOOL CALLING on `!is_streaming`
+        // (`agent/root.zig`: `native_tools_enabled = !is_streaming and
+        // provider.supportsNativeTools()`). Advertising streaming here while
+        // never actually streaming produced the worst of both: a non-streaming
+        // request carrying NO `tools` array, parsed on the streaming branch
+        // that does not read native `tool_calls`. The model was left to
+        // hand-roll the prompt-described textual dialect, so tool dispatch
+        // depended on its compliance with that format rather than on the
+        // protocol — and when compliance drifted, every tool call vanished
+        // with no config, prompt or binary change to point at.
+        if (self.max_streaming_prompt_bytes) |limit| {
+            if (limit == 0) return false;
+        }
         return !self.disable_streaming and self.api_mode != .responses;
     }
 
@@ -2279,6 +2295,27 @@ test "supportsNativeTools returns true for compatible" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "a provider that never streams does not advertise streaming" {
+    // `max_streaming_prompt_bytes = 0` means EVERY request skips streaming
+    // (`shouldSkipStreaming` compares `>= limit`). The agent loop gates native
+    // tool calling on `!is_streaming`, and the streaming branch hardcodes
+    // `.tools = null`, so a provider that advertises streaming it never
+    // performs silently strips the tools array from every request and leaves
+    // the model to hand-roll the prompt-described textual dialect.
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
+    p.max_streaming_prompt_bytes = 0;
+    try std.testing.expect(!p.provider().supportsStreaming());
+
+    // A positive limit is an ordinary size threshold, not "never": streaming
+    // stays advertised and small requests still stream.
+    p.max_streaming_prompt_bytes = 64_000;
+    try std.testing.expect(p.provider().supportsStreaming());
+
+    // Unset is unchanged — no limit, always attempt streaming.
+    p.max_streaming_prompt_bytes = null;
+    try std.testing.expect(p.provider().supportsStreaming());
 }
 
 test "capNonStreamingMaxTokens caps request max_tokens above provider limit" {
