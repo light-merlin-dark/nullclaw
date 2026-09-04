@@ -38,6 +38,8 @@ pub const McpServer = struct {
     http_client: ?http_util.ProxyHttpClient,
     next_id: u32,
     mcp_session_id: ?[]u8,
+    /// Each managed wrapper retains this connection until its own removal.
+    wrapper_refs: usize = 0,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -458,7 +460,7 @@ pub fn parseCallToolOutcome(allocator: Allocator, resp: []const u8) !CallToolOut
 pub const McpToolWrapper = struct {
     allocator: Allocator,
     server: *McpServer,
-    owns_server: bool,
+    retains_server: bool,
     original_name: []const u8,
     prefixed_name: []const u8,
     desc: []const u8,
@@ -520,9 +522,13 @@ pub const McpToolWrapper = struct {
         _ = allocator;
         const self: *McpToolWrapper = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
-        if (self.owns_server) {
-            self.server.deinit();
-            alloc.destroy(self.server);
+        if (self.retains_server) {
+            std.debug.assert(self.server.wrapper_refs > 0);
+            self.server.wrapper_refs -= 1;
+            if (self.server.wrapper_refs == 0) {
+                self.server.deinit();
+                alloc.destroy(self.server);
+            }
         }
         alloc.free(self.original_name);
         alloc.free(self.prefixed_name);
@@ -578,7 +584,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             }
         }
 
-        for (tool_defs, 0..) |td, idx| {
+        for (tool_defs) |td| {
             var wrapper = try allocator.create(McpToolWrapper);
             errdefer allocator.destroy(wrapper);
             // Avoid double-prefixing when the MCP server already namespaces tools
@@ -594,13 +600,14 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             wrapper.* = .{
                 .allocator = allocator,
                 .server = server,
-                .owns_server = idx == 0,
+                .retains_server = true,
                 .original_name = td.name,
                 .prefixed_name = prefixed_name,
                 .desc = td.description,
                 .params_json = td.input_schema,
             };
             try all_tools.append(allocator, wrapper.tool());
+            server.wrapper_refs += 1;
             transferred_count += 1;
         }
 
@@ -841,7 +848,7 @@ test "McpToolWrapper vtable name" {
     var wrapper = McpToolWrapper{
         .allocator = std.testing.allocator,
         .server = &server,
-        .owns_server = false,
+        .retains_server = false,
         .original_name = "read_file",
         .prefixed_name = "mcp_fs_read_file",
         .desc = "Read a file from disk",
@@ -859,7 +866,7 @@ test "McpToolWrapper vtable description" {
     var wrapper = McpToolWrapper{
         .allocator = std.testing.allocator,
         .server = &server,
-        .owns_server = false,
+        .retains_server = false,
         .original_name = "read_file",
         .prefixed_name = "mcp_fs_read_file",
         .desc = "Read a file from disk",
@@ -877,7 +884,7 @@ test "McpToolWrapper vtable parameters_json" {
     var wrapper = McpToolWrapper{
         .allocator = std.testing.allocator,
         .server = &server,
-        .owns_server = false,
+        .retains_server = false,
         .original_name = "read_file",
         .prefixed_name = "mcp_fs_read_file",
         .desc = "Read a file",
@@ -1019,4 +1026,38 @@ test "extractJsonFromSse reuses non-SSE fallback buffer" {
     const got = try extractJsonFromSse(std.testing.allocator, body);
     defer freeExtractedTestBody(body, got);
     try std.testing.expectEqual(body.ptr, got.ptr);
+}
+
+// Regression: filtering the first discovered tool used to destroy the shared
+// HTTP connection, leaving the allowed sibling with error.NoHttpClient (or a
+// dangling pointer). Any removal order must retain the connection to the last
+// wrapper; the testing allocator proves that the final release frees it once.
+test "McpToolWrapper shared connection survives arbitrary sibling removal" {
+    const alloc = std.testing.allocator;
+    for ([_][3]usize{ .{ 0, 1, 2 }, .{ 2, 1, 0 }, .{ 0, 2, 1 } }) |order| {
+        const server = try alloc.create(McpServer);
+        server.* = McpServer.init(alloc, .{ .name = "fixture", .command = "", .transport = "http", .url = "http://127.0.0.1:1/mcp" });
+        try server.connectHttp(); // Construct the real client; never open a socket.
+        var wrappers: [3]*McpToolWrapper = undefined;
+        for (&wrappers) |*slot| {
+            slot.* = try alloc.create(McpToolWrapper);
+            slot.*.* = .{
+                .allocator = alloc,
+                .server = server,
+                .retains_server = true,
+                .original_name = try alloc.dupe(u8, "tool"),
+                .prefixed_name = try alloc.dupe(u8, "mcp_fixture_tool"),
+                .desc = try alloc.dupe(u8, "Fixture"),
+                .params_json = try alloc.dupe(u8, "{}"),
+            };
+            server.wrapper_refs += 1;
+        }
+        for (order, 0..) |index, removed| {
+            wrappers[index].tool().deinit(alloc);
+            if (removed < 2) {
+                try std.testing.expect(server.http_client != null);
+                try std.testing.expectEqual(2 - removed, server.wrapper_refs);
+            }
+        }
+    }
 }
