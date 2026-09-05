@@ -1001,15 +1001,18 @@ pub const Agent = struct {
         return response_text;
     }
 
-    /// Whether a dispatched tool call satisfies the configured terminal-commit
-    /// marker. Matched against BOTH the tool name and the raw arguments JSON,
-    /// because a lane that funnels every command through one tool (e.g. an
-    /// `invoke {command: ...}` CLI surface) carries the commit's name only in
-    /// the arguments.
-    fn toolCallMatchesCommitMarker(marker: []const u8, name: []const u8, arguments_json: []const u8) bool {
+    /// Match the actual registered tool or top-level funnel command, never a
+    /// mention of the marker in a work tool's body, path or nested arguments.
+    fn toolCallMatchesCommitMarker(allocator: std.mem.Allocator, marker: []const u8, name: []const u8, arguments_json: []const u8) bool {
         if (marker.len == 0) return false;
-        return std.mem.indexOf(u8, name, marker) != null or
-            std.mem.indexOf(u8, arguments_json, marker) != null;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t\r\n"), marker)) return true;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const command = parsed.value.object.get("command") orelse return false;
+        if (command != .string) return false;
+        var tokens = std.mem.tokenizeAny(u8, command.string, " \t\r\n");
+        return std.mem.eql(u8, tokens.next() orelse return false, marker);
     }
 
     /// Measured terminal-commit acknowledgement for final_commit_marker lanes.
@@ -3003,27 +3006,21 @@ pub const Agent = struct {
                     return self.interruptedReply();
                 }
 
+                if (terminal_commit_state == .committed or terminal_commit_state == .ambiguous or terminal_definitive_refusals >= 2) {
+                    // Completion or a terminal failure ends execution, including later calls emitted
+                    // in the same batch. Keep their unexecuted result in history.
+                    results_buf.appendAssumeCapacity(.{ .name = call.name, .output = if (terminal_commit_state == .committed) "Not executed: terminal commit already acknowledged" else "Not executed: terminal commit failed closed", .success = false, .tool_call_id = call.tool_call_id });
+                    continue;
+                }
+
                 // A terminal attempt is only a marker match on a REGISTERED
                 // outer tool (same trim/case rules as execution); the state
                 // transition itself is decided after the result is known.
                 const matches_terminal_marker = if (self.final_commit_marker) |marker|
                     self.isRegisteredToolName(call.name) and
-                        toolCallMatchesCommitMarker(marker, call.name, call.arguments_json)
+                        toolCallMatchesCommitMarker(arena, marker, call.name, call.arguments_json)
                 else
                     false;
-
-                if (matches_terminal_marker and terminal_commit_state == .ambiguous) {
-                    // A prior terminal attempt may have landed server-side;
-                    // re-dispatching could duplicate it. Block without
-                    // executing; the turn fails closed after this batch.
-                    results_buf.appendAssumeCapacity(.{
-                        .name = call.name,
-                        .output = "Terminal commit outcome is ambiguous; re-dispatch blocked",
-                        .success = false,
-                        .tool_call_id = call.tool_call_id,
-                    });
-                    continue;
-                }
 
                 if (self.log_tool_calls) {
                     log.info(
@@ -3105,7 +3102,7 @@ pub const Agent = struct {
                 // typed outcome. Committed is sticky: a duplicate attempt's
                 // later refusal never regresses it.
                 if (matches_terminal_marker and terminal_commit_state != .committed) {
-                    if (result.success) {
+                    if (result.success and result.outcome == .ok) {
                         terminal_commit_state = .committed;
                     } else switch (result.outcome) {
                         .transport_failed => terminal_commit_state = .ambiguous,
@@ -3154,6 +3151,18 @@ pub const Agent = struct {
             }
 
             self.trimHistory();
+
+            if (terminal_commit_state == .committed) {
+                // The server acknowledged the terminal tool. Its persisted
+                // proposal is the answer; no model-generated epilogue is needed.
+                // Usage and tool events were already recorded, and history now
+                // contains the actual result. Stdout is a runtime diagnostic.
+                if (self.mem_rt) |rt| _ = rt.drainOutbox(self.allocator);
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
+                self.freeResponseFields(&response);
+                return self.allocator.dupe(u8, "[Terminal commit acknowledged]");
+            }
 
             // Terminal-commit gates, applied at the batch boundary so no
             // further completion can act on an unacceptable terminal state:
@@ -10138,21 +10147,23 @@ test "Agent shouldForceActionFollowThrough detects english deferred promise" {
 
 test "Agent toolCallMatchesCommitMarker matches name and arguments" {
     // Direct tool name match.
-    try std.testing.expect(Agent.toolCallMatchesCommitMarker("email_compose_reply", "email_compose_reply", "{}"));
+    try std.testing.expect(Agent.toolCallMatchesCommitMarker(std.testing.allocator, "email_compose_reply", "email_compose_reply", "{}"));
     // A CLI-funnel lane carries the commit only in the arguments.
     try std.testing.expect(Agent.toolCallMatchesCommitMarker(
+        std.testing.allocator,
         "email_compose_reply",
         "mcp_granis_invoke",
         "{\"command\": \"email_compose_reply --reply-text ...\"}",
     ));
     // A work call is not a commit.
     try std.testing.expect(!Agent.toolCallMatchesCommitMarker(
+        std.testing.allocator,
         "email_compose_reply",
         "mcp_granis_invoke",
         "{\"command\": \"email_providers_intake_extract_attachment --id abc\"}",
     ));
     // Empty marker never matches (guard against a misconfigured empty string).
-    try std.testing.expect(!Agent.toolCallMatchesCommitMarker("", "email_compose_reply", "{}"));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(std.testing.allocator, "", "email_compose_reply", "{}"));
 }
 
 // ── Terminal-commit acknowledgement harness ─────────────────────────
@@ -10349,6 +10360,88 @@ const TerminalCommitLaneHarness = struct {
     }
 };
 
+test "Agent terminal acknowledgement at the final budget emits no epilogue or later batch work" {
+    // Granis repeat-directors-live-01: the valid final candidate committed on
+    // the last provider request; an unnecessary epilogue failed the whole turn.
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+    var provider_state = H.ScriptedProvider{ .steps = &.{.{ .calls = &.{
+        .{ .id = "c1", .arguments = "{}" },
+        .{ .id = "c2", .name = "probe", .arguments = "{}" },
+    } }} };
+    var commit_tool = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    var probe_tool = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ commit_tool.tool(), probe_tool.tool() };
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.max_tool_iterations = 1;
+    defer agent.deinit();
+    const response = try agent.turn("compose");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), commit_tool.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe_tool.calls);
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, "committed: proposal staged"));
+    try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, "Not executed: terminal commit"));
+}
+
+test "Agent terminal marker in work arguments is not a completion" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+    var provider_state = H.ScriptedProvider{ .steps = &.{
+        .{ .calls = &.{.{ .id = "c1", .name = "probe", .arguments = "{\"note\":\"term_commit\"}" }} },
+        .{ .calls = &.{.{ .id = "c2", .arguments = "{}" }} },
+    } };
+    var commit_tool = H.ScriptedTerminalTool{ .results = &.{H.COMMITTED_RESULT} };
+    var probe_tool = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ commit_tool.tool(), probe_tool.tool() };
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+    const response = try agent.turn("compose");
+    defer allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), commit_tool.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe_tool.calls);
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "term_commit_history", "{}"));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", "{\"arguments\":{\"command\":\"term_commit\"}}"));
+}
+
+test "Agent terminal transport ambiguity outranks an inconsistent success flag" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+    var provider_state = H.ScriptedProvider{ .steps = &.{.{ .calls = &.{.{ .id = "c1", .arguments = "{}" }} }} };
+    var commit_tool = H.ScriptedTerminalTool{ .results = &.{.{ .success = true, .output = "not an acknowledgement", .outcome = .transport_failed }} };
+    const tool_list = [_]Tool{commit_tool.tool()};
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+    try std.testing.expectError(error.TerminalCommitAmbiguous, agent.turn("compose"));
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+}
+
+test "Agent terminal refusal budget blocks later work and commits in the same batch" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+    var provider_state = H.ScriptedProvider{ .steps = &.{.{ .calls = &.{
+        .{ .id = "c1", .arguments = "{\"attempt\":1}" },
+        .{ .id = "c2", .arguments = "{\"attempt\":2}" },
+        .{ .id = "c3", .arguments = "{\"attempt\":3}" },
+        .{ .id = "c4", .name = "probe", .arguments = "{}" },
+    } }} };
+    var commit_tool = H.ScriptedTerminalTool{ .results = &.{ H.REFUSED_RESULT, H.REFUSED_RESULT, H.COMMITTED_RESULT } };
+    var probe_tool = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{ commit_tool.tool(), probe_tool.tool() };
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    defer agent.deinit();
+    try std.testing.expectError(error.TerminalCommitRefused, agent.turn("compose"));
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 2), commit_tool.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe_tool.calls);
+}
+
 test "Agent terminal commit refused then corrected commits and ends clean" {
     const H = TerminalCommitLaneHarness;
     const allocator = std.testing.allocator;
@@ -10368,9 +10461,9 @@ test "Agent terminal commit refused then corrected commits and ends clean" {
     const response = try agent.turn("compose the reply");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("committed done", response);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
     try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
-    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     // The refusal text reached the model as a tool result.
     try std.testing.expect(H.countHistoryContaining(&agent, "askDispositions must account") >= 1);
     // The model corrected itself from the tool result alone — no nudges.
@@ -10400,7 +10493,7 @@ test "Agent terminal commit refused twice fails closed with typed error" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
-test "Agent terminal commit stays committed through a later duplicate refusal" {
+test "Agent terminal success prevents a later duplicate provider turn" {
     const H = TerminalCommitLaneHarness;
     const allocator = std.testing.allocator;
 
@@ -10419,10 +10512,10 @@ test "Agent terminal commit stays committed through a later duplicate refusal" {
     const response = try agent.turn("compose the reply");
     defer allocator.free(response);
 
-    // The duplicate attempt's refusal never regresses the committed state:
-    // the turn still ends as a normal prose success with zero nudges.
-    try std.testing.expectEqualStrings("all done", response);
-    try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
+    // The duplicate and provider epilogue are never requested after success.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
     try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
     try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
 }
@@ -10494,7 +10587,7 @@ test "Agent premature prose before any terminal attempt still gets the existing 
     const response = try agent.turn("compose the reply");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done after commit", response);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
     try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
     // Exactly one premature-prose nudge, and no corrective nudge.
     try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
@@ -10521,9 +10614,9 @@ test "Agent refused terminal commit then prose gets one corrective nudge then co
     const response = try agent.turn("compose the reply");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
     try std.testing.expectEqual(@as(usize, 2), tool_impl.calls);
-    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
     // Exactly one corrective nudge, and the premature-prose nudge never fired.
     try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.CORRECTIVE_NUDGE_SENTINEL));
     try std.testing.expectEqual(@as(usize, 0), H.countHistoryContaining(&agent, H.PREMATURE_NUDGE_SENTINEL));
@@ -10632,8 +10725,8 @@ test "Agent not-attempted iteration exhaustion spends one reserved terminal comp
     try std.testing.expectEqual(@as(usize, 1), tool_impl.calls);
     try std.testing.expectEqual(@as(usize, 2), probe_impl.calls);
     try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, H.EXHAUSTION_NUDGE_SENTINEL));
-    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
-    try std.testing.expect(std.mem.indexOf(u8, response, "committed done") != null);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expect(std.mem.eql(u8, response, "[Terminal commit acknowledged]"));
 }
 
 test "Agent not-attempted exhaustion whose reserved completion proses fails closed" {

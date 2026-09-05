@@ -1,5 +1,21 @@
 # Nullclaw fork — active integration
 
+## Terminal acknowledgement completion — 5 September 2026
+
+Granis's native repetition fixture committed a correct fourth answer at its
+provider ceiling, then returned 503 because the loop requested an unnecessary
+model epilogue. The existing typed terminal state already knows the server
+acknowledged success. This slice ends after recording that result/history,
+emits turn-complete and returns a diagnostic without another model call or
+later tool execution in the batch. Refused/ambiguous outcomes retain their
+bounded correction/fail-closed paths. Ordinary unconfigured turns are unchanged.
+Marker matching now uses the registered exact tool or top-level command token;
+mentions inside arguments cannot cause an early exit. Inconsistent success plus
+transport failure remains ambiguous. Full Zig acceptance: **7,424 pass / 9 skip, 13/13 steps, 56 s**, no leaks.
+Both target builds and native-wire acceptance remain pending; Granis owns native-wire acceptance and deployment. No model-quality
+claim comes from diagnostic stdout. Existing foreign worktrees are preserved;
+their commits are all reachable from main. Upstream fetched, main21ahead/0behind.
+
 ## Native tool transport, 4 September 2026
 
 Source is accepted locally: full Zig gate 7,419 passed / 9 skipped, 59.73 s.
