@@ -9,8 +9,15 @@ optional executable prefix in `agent.final_commit_command_prefix`. Matching
 accepts that exact prefix plus the exact terminal token; unconfigured lanes,
 other prefixes, nested/body mentions and suffix lookalikes do not gain scope.
 Usage/typed outcomes and terminal success completion stay unchanged. Full fork
-gate passes7,426 tests /9 skipped, zero leaks (62 s); both target builds and
-actual consumer parity proof are pending.
+gate passes7,426 tests /9 skipped, zero leaks (62 s). Source`6a09a389` was
+built for both targets and vendored in Granis`cf4f87adb` (80 s). Actual native
+read→history→prefixed commit now exits0 with zero post-terminal calls (24 ms);
+bare spelling remains green (31 ms). Oldbinary`ac4b0c2b` reproduces a committed
+proposal followed by6 forbidden requests and exit1 (3.580 s). Granis retains
+before/after receipts at `docs/reviews/evidence/2026-09-04-native-head-qualification/terminal-prefix-mechanics-01`.
+Granis owns independent integration/live acceptance and production activation;
+scripted provider results are mechanics only. Agent Central N8 records prefix
+parity without changing signed runtime pins.
 
 ## Terminal acknowledgement completion — 5 September 2026
 
