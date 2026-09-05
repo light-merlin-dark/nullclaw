@@ -1796,6 +1796,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.agent.final_commit_marker = try self.allocator.dupe(u8, v.string);
                 }
             }
+            if (ag.object.get("final_commit_command_prefix")) |v| {
+                if (v != .null) {
+                    if (v != .string or v.string.len == 0 or std.mem.indexOfAny(u8, v.string, " \t\r\n") != null) return error.InvalidFinalCommitCommandPrefix;
+                    self.agent.final_commit_command_prefix = try self.allocator.dupe(u8, v.string);
+                }
+            }
             if (ag.object.get("default_queue_mode")) |v| {
                 if (v != .string) return error.InvalidDefaultQueueMode;
                 self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse

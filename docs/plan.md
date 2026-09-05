@@ -1,5 +1,17 @@
 # Nullclaw fork — active integration
 
+## Declared CLI prefix parity — 5 September 2026
+
+Granis's real financial candidate was committed through the supported
+`granis email_compose_reply` command, but the runner recognized only the bare
+command and requested another provider response. The lane now declares its
+optional executable prefix in `agent.final_commit_command_prefix`. Matching
+accepts that exact prefix plus the exact terminal token; unconfigured lanes,
+other prefixes, nested/body mentions and suffix lookalikes do not gain scope.
+Usage/typed outcomes and terminal success completion stay unchanged. Full fork
+gate passes7,426 tests /9 skipped, zero leaks (62 s); both target builds and
+actual consumer parity proof are pending.
+
 ## Terminal acknowledgement completion — 5 September 2026
 
 Granis's native repetition fixture committed a correct fourth answer at its

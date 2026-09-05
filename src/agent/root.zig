@@ -339,6 +339,7 @@ pub const Agent = struct {
     /// reply before any marker-matching dispatched call gets a bounded SYSTEM
     /// follow-up instead of ending the turn.
     final_commit_marker: ?[]const u8 = null,
+    final_commit_command_prefix: ?[]const u8 = null,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -664,6 +665,7 @@ pub const Agent = struct {
             .vision_disabled_models = cfg.agent.vision_disabled_models,
             .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .final_commit_marker = cfg.agent.final_commit_marker,
+            .final_commit_command_prefix = cfg.agent.final_commit_command_prefix,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -1003,7 +1005,7 @@ pub const Agent = struct {
 
     /// Match the actual registered tool or top-level funnel command, never a
     /// mention of the marker in a work tool's body, path or nested arguments.
-    fn toolCallMatchesCommitMarker(allocator: std.mem.Allocator, marker: []const u8, name: []const u8, arguments_json: []const u8) bool {
+    fn toolCallMatchesCommitMarker(allocator: std.mem.Allocator, marker: []const u8, name: []const u8, arguments_json: []const u8, command_prefix: ?[]const u8) bool {
         if (marker.len == 0) return false;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t\r\n"), marker)) return true;
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch return false;
@@ -1012,7 +1014,10 @@ pub const Agent = struct {
         const command = parsed.value.object.get("command") orelse return false;
         if (command != .string) return false;
         var tokens = std.mem.tokenizeAny(u8, command.string, " \t\r\n");
-        return std.mem.eql(u8, tokens.next() orelse return false, marker);
+        const first = tokens.next() orelse return false;
+        if (std.mem.eql(u8, first, marker)) return true;
+        const prefix = command_prefix orelse return false;
+        return std.mem.eql(u8, first, prefix) and std.mem.eql(u8, tokens.next() orelse return false, marker);
     }
 
     /// Measured terminal-commit acknowledgement for final_commit_marker lanes.
@@ -3018,7 +3023,7 @@ pub const Agent = struct {
                 // transition itself is decided after the result is known.
                 const matches_terminal_marker = if (self.final_commit_marker) |marker|
                     self.isRegisteredToolName(call.name) and
-                        toolCallMatchesCommitMarker(arena, marker, call.name, call.arguments_json)
+                        toolCallMatchesCommitMarker(arena, marker, call.name, call.arguments_json, self.final_commit_command_prefix)
                 else
                     false;
 
@@ -10147,23 +10152,13 @@ test "Agent shouldForceActionFollowThrough detects english deferred promise" {
 
 test "Agent toolCallMatchesCommitMarker matches name and arguments" {
     // Direct tool name match.
-    try std.testing.expect(Agent.toolCallMatchesCommitMarker(std.testing.allocator, "email_compose_reply", "email_compose_reply", "{}"));
+    try std.testing.expect(Agent.toolCallMatchesCommitMarker(std.testing.allocator, "email_compose_reply", "email_compose_reply", "{}", null));
     // A CLI-funnel lane carries the commit only in the arguments.
-    try std.testing.expect(Agent.toolCallMatchesCommitMarker(
-        std.testing.allocator,
-        "email_compose_reply",
-        "mcp_granis_invoke",
-        "{\"command\": \"email_compose_reply --reply-text ...\"}",
-    ));
+    try std.testing.expect(Agent.toolCallMatchesCommitMarker(std.testing.allocator, "email_compose_reply", "mcp_granis_invoke", "{\"command\": \"email_compose_reply --reply-text ...\"}", null));
     // A work call is not a commit.
-    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(
-        std.testing.allocator,
-        "email_compose_reply",
-        "mcp_granis_invoke",
-        "{\"command\": \"email_providers_intake_extract_attachment --id abc\"}",
-    ));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(std.testing.allocator, "email_compose_reply", "mcp_granis_invoke", "{\"command\": \"email_providers_intake_extract_attachment --id abc\"}", null));
     // Empty marker never matches (guard against a misconfigured empty string).
-    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(std.testing.allocator, "", "email_compose_reply", "{}"));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(std.testing.allocator, "", "email_compose_reply", "{}", null));
 }
 
 // ── Terminal-commit acknowledgement harness ─────────────────────────
@@ -10386,6 +10381,30 @@ test "Agent terminal acknowledgement at the final budget emits no epilogue or la
     try std.testing.expectEqual(@as(usize, 1), H.countHistoryContaining(&agent, "Not executed: terminal commit"));
 }
 
+test "Agent declared command prefix acknowledges terminal success without an epilogue" {
+    const H = TerminalCommitLaneHarness;
+    const allocator = std.testing.allocator;
+    var provider_state = H.ScriptedProvider{ .steps = &.{.{ .calls = &.{.{ .id = "c1", .name = "probe", .arguments = "{\"command\":\"granis term_commit\"}" }} }} };
+    var probe_tool = H.ScriptedProbeTool{};
+    const tool_list = [_]Tool{probe_tool.tool()};
+    var noop = observability.NoopObserver{};
+    var agent = try H.makeAgent(allocator, provider_state.provider(), &tool_list, noop.observer());
+    agent.final_commit_command_prefix = "granis";
+    defer agent.deinit();
+    const response = try agent.turn("compose");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("[Terminal commit acknowledged]", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), probe_tool.calls);
+    for ([_][]const u8{ "other term_commit", "granis term_commit_history", "granis granis term_commit", "term_commit_history granis" }) |command| {
+        const args = try std.fmt.allocPrint(allocator, "{{\"command\":\"{s}\"}}", .{command});
+        defer allocator.free(args);
+        try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", args, "granis"));
+    }
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", "{\"command\":\"granis term_commit\"}", null));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", "{\"note\":\"granis term_commit\"}", "granis"));
+}
+
 test "Agent terminal marker in work arguments is not a completion" {
     const H = TerminalCommitLaneHarness;
     const allocator = std.testing.allocator;
@@ -10404,8 +10423,8 @@ test "Agent terminal marker in work arguments is not a completion" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expectEqual(@as(usize, 1), commit_tool.calls);
     try std.testing.expectEqual(@as(usize, 1), probe_tool.calls);
-    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "term_commit_history", "{}"));
-    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", "{\"arguments\":{\"command\":\"term_commit\"}}"));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "term_commit_history", "{}", null));
+    try std.testing.expect(!Agent.toolCallMatchesCommitMarker(allocator, "term_commit", "probe", "{\"arguments\":{\"command\":\"term_commit\"}}", null));
 }
 
 test "Agent terminal transport ambiguity outranks an inconsistent success flag" {

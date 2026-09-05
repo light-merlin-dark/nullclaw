@@ -1367,6 +1367,7 @@ pub const Config = struct {
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
             .enable_pii_redaction = self.agent.enable_pii_redaction,
             .final_commit_marker = self.agent.final_commit_marker,
+            .final_commit_command_prefix = self.agent.final_commit_command_prefix,
         }, ",\n");
 
         // Channels
@@ -4130,6 +4131,18 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(usize, 1), cfg.agent.vision_disabled_models.len);
     try std.testing.expectEqualStrings("router/text-only", cfg.agent.vision_disabled_models[0]);
     try std.testing.expect(!cfg.agent.auto_disable_vision_on_error);
+}
+
+test "json parse declared terminal command prefix is one exact optional token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson("{\"agent\":{\"final_commit_command_prefix\":null}}");
+    try std.testing.expect(cfg.agent.final_commit_command_prefix == null);
+    try cfg.parseJson("{\"agent\":{\"final_commit_command_prefix\":\"granis\"}}");
+    try std.testing.expectEqualStrings("granis", cfg.agent.final_commit_command_prefix.?);
+    try std.testing.expectError(error.InvalidFinalCommitCommandPrefix, cfg.parseJson("{\"agent\":{\"final_commit_command_prefix\":\"granis other\"}}"));
+    try std.testing.expectError(error.InvalidFinalCommitCommandPrefix, cfg.parseJson("{\"agent\":{\"final_commit_command_prefix\":\"\"}}"));
 }
 
 test "json parse agent token_limit explicit remains false when omitted" {
